@@ -1,0 +1,19 @@
+# Alternative: 모든 것을 train 모드로 통일
+
+만약 여전히 문제가 있다면 main.py의 line 174를 수정:
+
+# 현재 (eval 모드)
+net.eval()
+print("DLG will use eval mode for stability (with restored BN stats)")
+
+# 대안 (train 모드 - 완전한 일관성)
+net.train()
+print("DLG will use train mode for consistency (may be noisy)")
+
+이렇게 하면:
+- Target gradient: train 모드
+- DLG reconstruction: train 모드
+- 완전한 일관성, 하지만 batch size=1로 인해 노이즈 가능성
+
+노이즈가 심하면 TV weight을 증가:
+Line 217: total_loss = grad_diff + 1e-3 * tv_loss  # 1e-4 → 1e-3
