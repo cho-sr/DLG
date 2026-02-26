@@ -275,7 +275,10 @@ def dlg_attack(model, target_gradients, gt_shape, label_shape, iters, device, gt
 
     dummy_data = torch.randn(gt_shape).to(device).requires_grad_(True)
     dummy_label = torch.randn(label_shape).to(device).requires_grad_(True)
-    optimizer = torch.optim.LBFGS([dummy_data, dummy_label])
+    optimizer = torch.optim.LBFGS([dummy_data, dummy_label],
+                                  lr=1.0,
+                                  history_size=100,
+                                  max_iter=20)
 
     progress_snapshots = []
     loss_history = []
