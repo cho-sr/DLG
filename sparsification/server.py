@@ -15,8 +15,10 @@ import warnings
 import random
 import os
 from torchvision import models
+from torchvision import datasets
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms.v2 as v2
+from models.vision import LeNet
 warnings.filterwarnings("ignore")
 
 SEED = 42
@@ -29,9 +31,9 @@ torch.backends.cudnn.benchmark = False
 test_loader = None
 
 ############################################## 수정 불가 1 ##############################################
-IMG_SIZE = 192
-NUM_CLASSES = 4
-DATASET_NAME = "./dataset/test.pt"
+IMG_SIZE = 32
+NUM_CLASSES = 10
+DATASET_ROOT = "./dataset"
 ######################################################################################################
 
 ####################################################### 수정 가능 #######################################################
@@ -44,10 +46,11 @@ port = 8081 # 1024번 ~ 65535번
 
 
 test_transform = v2.Compose([
+    v2.ToImage(),
     v2.Resize((IMG_SIZE, IMG_SIZE)),
     v2.ToDtype(torch.float32, scale=True),
-    v2.Normalize(mean=[0.485, 0.456, 0.406],
-                 std=[0.229, 0.224, 0.225]),
+    v2.Normalize(mean=[0.4914, 0.4822, 0.4465],
+                 std=[0.2023, 0.1994, 0.2010])
 ])
 
 
@@ -108,6 +111,12 @@ class Network1(nn.Module):
 
         return x
 
+def build_model():
+    model = LeNet()
+    if NUM_CLASSES != 10:
+        model.fc[0] = nn.Linear(model.fc[0].in_features, NUM_CLASSES)
+    return model
+
 
 class CustomDataset(Dataset):
     def __init__(self, pt_path: str, is_train: bool = False, transform=None):
@@ -128,9 +137,8 @@ class CustomDataset(Dataset):
         return x, y
 
 def measure_accuracy(global_model, test_loader):
-    model = Network1().to(device)
+    model = build_model().to(device)
     model.load_state_dict(global_model)
-    model.half()
     model.eval()
 
     accuracy = 0.0
@@ -141,7 +149,7 @@ def measure_accuracy(global_model, test_loader):
     with torch.no_grad():
         print("\n")
         for inputs, labels in tqdm(test_loader, desc="Test"):
-            inputs = inputs.to(device).half()
+            inputs = inputs.to(device)
             labels = labels.to(device)
             outputs = model(inputs)
             correct += (outputs.argmax(1) == labels).sum().item()
@@ -254,13 +262,18 @@ def main():
     address = []
 
     ############################ 수정 가능 ############################
-    train_dataset = CustomDataset(DATASET_NAME, is_train=False, transform=test_transform)
+    train_dataset = datasets.CIFAR10(
+        root=DATASET_ROOT,
+        train=False,
+        download=True,
+        transform=test_transform,
+    )
 
     test_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=batch_size, shuffle=False, num_workers=0
     )
 
-    model = Network1().half().to(device)
+    model = build_model().to(device)
     ####################################################################
 
     print(f"Server is listening on {host}:{port}")

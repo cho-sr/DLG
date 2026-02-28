@@ -16,8 +16,10 @@ import warnings
 import select
 import os
 from torchvision import models
+from torchvision import datasets
 import torchvision.transforms.v2 as v2
 from models.vision import LeNet
+
 warnings.filterwarnings("ignore")
 
 SEED = 42
@@ -30,27 +32,28 @@ torch.backends.cudnn.benchmark = False
 
 
 ############################################## 수정 금지 1 ##############################################
-IMG_SIZE = 192
-NUM_CLASSES = 4
-DATASET_NAME = "./dataset/client1.pt"
+IMG_SIZE = 32
+NUM_CLASSES = 10
+DATASET_ROOT = "./dataset"
 ######################################################################################################
 
 
 ############################################# 수정 가능 #############################################
-local_epochs = 1
-lr = 0.001
-batch_size = 32
+local_epochs = 2
+lr = 0.1
+batch_size = 128
 host_ip = "127.0.0.1"
 port = 8081
 
 
-################# 전처리 코드 수정 가능하나 꼭 IMG_SIZE로 resize한 뒤 정규화 해야 함 #################
+################# 전처리 코드 수정 가능하나 꼭 IMG_SIZE로 resize한 뒤 정규화 해야 함#################
 train_transform = v2.Compose([
+    v2.ToImage(),
     v2.Resize((IMG_SIZE, IMG_SIZE)),
     v2.RandomHorizontalFlip(0.5),
     v2.ToDtype(torch.float32, scale=True),
-    v2.Normalize(mean=[0.485, 0.456, 0.406],
-                 std=[0.229, 0.224, 0.225]),
+    v2.Normalize(mean=[0.4914, 0.4822, 0.4465],
+                 std=[0.2023, 0.1994, 0.2010])
 ])
 
 
@@ -118,7 +121,19 @@ class CustomDataset(Dataset):
         return x, y
 
 def main():
-    train_dataset = CustomDataset(DATASET_NAME, is_train=True, transform=train_transform)
+    train_dataset = datasets.CIFAR10(
+        root=DATASET_ROOT,
+        train=True,
+        download=True,
+        transform=train_transform,
+    )
+    indices = np.arange(len(train_dataset))
+    rng = np.random.default_rng(SEED)
+    rng.shuffle(indices)
+
+    half = len(indices) // 2
+    client_idx = indices[:half]   # client1 = 앞 절반
+    train_dataset = Subset(train_dataset, client_idx)
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True, num_workers=0
@@ -128,9 +143,8 @@ def main():
     if NUM_CLASSES != 10:
         model.fc[0] = nn.Linear(model.fc[0].in_features, NUM_CLASSES)
     model = model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
-    class_weights = torch.tensor([3.1, 4.0, 2.5, 3.3]).to(device)
-    criterion = torch.nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr, )
+    criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
 ##############################################################################################################################
 
 
@@ -153,7 +167,7 @@ def main():
         print("\nReceived updated global model from server")
 
         model.load_state_dict(weight, strict=True)
-
+       
         read_sockets, _, _ = select.select([client], [], [], 0)
         if read_sockets:
             print("Federated Learning finished")
@@ -181,11 +195,3 @@ if __name__ == "__main__":
     main()
 
 ######################################################################################################################
-
-
-
-
-
-
-
-

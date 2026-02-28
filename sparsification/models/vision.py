@@ -15,7 +15,7 @@ def weights_init(m):
 class LeNet(nn.Module):
     def __init__(self):
         super(LeNet, self).__init__()
-        act = nn.Sigmoid
+        act = nn.ReLU
         self.body = nn.Sequential(
             nn.Conv2d(3, 12, kernel_size=5, padding=5//2, stride=2),
             act(),
