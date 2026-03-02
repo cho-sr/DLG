@@ -19,6 +19,7 @@ from torchvision import models
 from torchvision import datasets
 import torchvision.transforms.v2 as v2
 from models.vision import LeNet
+from utils import label_to_onehot, cross_entropy_for_onehot
 
 warnings.filterwarnings("ignore")
 
@@ -35,29 +36,43 @@ torch.backends.cudnn.benchmark = False
 IMG_SIZE = 32
 NUM_CLASSES = 10
 DATASET_ROOT = "./dataset"
+NORM_MEAN = [0.4914, 0.4822, 0.4465]
+NORM_STD = [0.2023, 0.1994, 0.2010]
 ######################################################################################################
 
 
 ############################################# 수정 가능 #############################################
-local_epochs = 2
+local_epochs = 1
 lr = 0.1
 batch_size = 128
 host_ip = "127.0.0.1"
 port = 8081
+client_id = 1
 
 
 ################# 전처리 코드 수정 가능하나 꼭 IMG_SIZE로 resize한 뒤 정규화 해야 함#################
 train_transform = v2.Compose([
     v2.ToImage(),
     v2.Resize((IMG_SIZE, IMG_SIZE)),
-    v2.RandomHorizontalFlip(0.5),
+    # v2.RandomHorizontalFlip(0.5),
     v2.ToDtype(torch.float32, scale=True),
-    v2.Normalize(mean=[0.4914, 0.4822, 0.4465],
-                 std=[0.2023, 0.1994, 0.2010])
+    # v2.Normalize(mean=NORM_MEAN, std=NORM_STD)
 ])
 
 
 scaler = torch.amp.GradScaler('cuda')
+
+
+def extract_attack_gradient(model, x, y):
+    model.eval()
+    x = x.to(device)
+    y = y.to(device)
+    y_onehot = label_to_onehot(y, num_classes=NUM_CLASSES)
+
+    pred = model(x)
+    loss = cross_entropy_for_onehot(pred, y_onehot)
+    dy_dx = torch.autograd.grad(loss, model.parameters())
+    return [g.detach().cpu().clone() for g in dy_dx]
 
 def train(model, criterion, optimizer, train_loader):
     model.to(device)
@@ -154,6 +169,7 @@ def main():
 ########################################################### 수정 금지 2 ##############################################################
     client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     client.connect((host_ip, port))
+    round_idx = 0
 
     while True:
         data_size = struct.unpack('>I', client.recv(4))[0]
@@ -173,9 +189,33 @@ def main():
             print("Federated Learning finished")
             break
 
+        # Capture one-sample true gradient before local training for DLG.
+        attack_x, attack_y = train_dataset[round_idx % len(train_dataset)]
+        attack_x = attack_x.unsqueeze(0)
+        attack_y = torch.tensor([int(attack_y)], dtype=torch.long)
+        attack_grad = extract_attack_gradient(model, attack_x, attack_y)
+        model_state_at_grad = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
         model = train(model, criterion, optimizer, train_loader)
 
-        model_data = pickle.dumps(dict(model.state_dict().items()))
+        round_idx += 1
+        payload = {
+            "type": "client_update",
+            "client_id": client_id,
+            "round": round_idx,
+            "model_state": dict(model.state_dict().items()),
+            "attack": {
+                "num_classes": NUM_CLASSES,
+                "input_shape": tuple(attack_x.shape),
+                "norm_mean": list(NORM_MEAN),
+                "norm_std": list(NORM_STD),
+                "gradients": attack_grad,
+                "model_state": model_state_at_grad,
+                "gt_data": attack_x.detach().cpu().clone(),
+                "gt_label": int(attack_y.item()),
+            },
+        }
+        model_data = pickle.dumps(payload)
         client.sendall(struct.pack('>I', len(model_data)))
         client.sendall(model_data)
 

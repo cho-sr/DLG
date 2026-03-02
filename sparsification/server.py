@@ -14,6 +14,7 @@ import copy
 import warnings
 import random
 import os
+from pathlib import Path
 from torchvision import models
 from torchvision import datasets
 from torch.utils.data import Dataset, DataLoader
@@ -43,73 +44,20 @@ batch_size = 64  # 사용자 편의에 맞게 조정
 num_samples = 1280   # 사용자 편의에 맞게 조정
 host = '127.0.0.1' # loop back으로 연합학습 수행 시 사용될 ip
 port = 8081 # 1024번 ~ 65535번
+DLG_RECORD_DIR = Path(__file__).resolve().parent / "dlg_records"
+DLG_SAVE_ROUNDS = {5, 10, 15, 20, 25, 30}
 
 
 test_transform = v2.Compose([
     v2.ToImage(),
     v2.Resize((IMG_SIZE, IMG_SIZE)),
     v2.ToDtype(torch.float32, scale=True),
-    v2.Normalize(mean=[0.4914, 0.4822, 0.4465],
-                 std=[0.2023, 0.1994, 0.2010])
+    # v2.Normalize(mean=[0.4914, 0.4822, 0.4465],std=[0.2023, 0.1994, 0.2010])
 ])
 
 
 
 
-
-class Network1(nn.Module):
-    def __init__(self, num_classes=4):
-        super(Network1, self).__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 16, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(16),
-            nn.ReLU6(inplace=True),
-
-            nn.Conv2d(16, 16, 3, padding=1, groups=16, bias=False),
-            nn.BatchNorm2d(16),
-            nn.ReLU6(inplace=True),
-            nn.Conv2d(16, 32, 1, bias=False),
-            nn.BatchNorm2d(32),
-            nn.ReLU6(inplace=True),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(32, 32, 3, padding=1, groups=32, bias=False),
-            nn.BatchNorm2d(32),
-            nn.ReLU6(inplace=True),
-            nn.Conv2d(32, 64, 1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU6(inplace=True),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(64, 64, 3, padding=1, groups=64, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU6(inplace=True),
-            nn.Conv2d(64, 128, 1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.ReLU6(inplace=True),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(128, 128, 3, padding=1, groups=128, bias=False),
-            nn.BatchNorm2d(128),
-            nn.ReLU6(inplace=True),
-            nn.Conv2d(128, 256, 1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.ReLU6(inplace=True),
-
-            nn.AdaptiveAvgPool2d(1)
-        )
-        self.classifier = nn.Sequential(
-            nn.BatchNorm2d(256),
-            nn.Dropout(0.2),
-            nn.Conv2d(256, num_classes,kernel_size=1)
-        )
-
-    def forward(self, x):
-        x = self.features(x)
-        x = self.classifier(x)
-        x = x.view(x.size(0), -1)
-
-        return x
 
 def build_model():
     model = LeNet()
@@ -201,7 +149,28 @@ def handle_client(conn, addr, model, test_loader):
         while remaining_payload_size != 0:
             received_payload += conn.recv(remaining_payload_size)
             remaining_payload_size = data_size - len(received_payload)
-        model = pickle.loads(received_payload)
+        received = pickle.loads(received_payload)
+        if isinstance(received, dict) and "model_state" in received:
+            model = received["model_state"]
+
+            attack = received.get("attack")
+            round_idx = int(received.get("round", 0))
+            client_id = int(received.get("client_id", -1))
+            if isinstance(attack, dict) and round_idx in DLG_SAVE_ROUNDS and client_id > 0:
+                save_attack_record(
+                    round_idx=round_idx,
+                    client_id=client_id,
+                    gradients=attack.get("gradients"),
+                    model_state=attack.get("model_state"),
+                    num_classes=int(attack.get("num_classes", NUM_CLASSES)),
+                    input_shape=tuple(attack.get("input_shape", (1, 3, IMG_SIZE, IMG_SIZE))),
+                    norm_mean=attack.get("norm_mean"),
+                    norm_std=attack.get("norm_std"),
+                    gt_data=attack.get("gt_data"),
+                    gt_label=attack.get("gt_label"),
+                )
+        else:
+            model = received
 
         model_list.append(model)
         # print(models)
@@ -226,6 +195,44 @@ def handle_client(conn, addr, model, test_loader):
             weight = pickle.dumps(dict(global_model.state_dict().items()))
             conn.send(struct.pack('>I', len(weight)))
             conn.send(weight)
+
+def save_attack_record(
+    round_idx,
+    client_id,
+    gradients,
+    model_state,
+    num_classes,
+    input_shape,
+    norm_mean=None,
+    norm_std=None,
+    gt_data=None,
+    gt_label=None,
+):
+    if gradients is None or model_state is None:
+        return
+
+    DLG_RECORD_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = DLG_RECORD_DIR / f"round_{int(round_idx):03d}_client_{int(client_id)}.pt"
+
+    payload = {
+        "round": int(round_idx),
+        "client_id": int(client_id),
+        "num_classes": int(num_classes),
+        "input_shape": tuple(input_shape),
+        "gradients": [g.detach().cpu().clone() for g in gradients],
+        "model_state": {k: v.detach().cpu().clone() for k, v in model_state.items()},
+    }
+    if norm_mean is not None:
+        payload["norm_mean"] = list(norm_mean)
+    if norm_std is not None:
+        payload["norm_std"] = list(norm_std)
+    if gt_data is not None:
+        payload["gt_data"] = gt_data.detach().cpu().clone()
+    if gt_label is not None:
+        payload["gt_label"] = int(gt_label)
+
+    torch.save(payload, out_path)
+    print(f"[DLG] Saved gradient record: {out_path.name}")
 
 def get_model_size(global_model):
     model_size = len(pickle.dumps(dict(global_model.state_dict().items())))
