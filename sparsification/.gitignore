@@ -1,0 +1,28 @@
+# datasets
+dataset/
+datasets/
+**/dataset/
+**/datasets/
+
+# CIFAR tarball
+**/cifar-10-python.tar.gz
+**/*.tar.gz
+**/*.zip
+
+# common data files
+**/*.csv
+**/*.tsv
+**/*.json
+**/*.jsonl
+**/*.parquet
+**/*.h5
+**/*.hdf5
+**/*.npy
+**/*.npz
+**/*.pkl
+**/*.pt
+**/*.pth
+
+# python cache
+**/__pycache__/
+**/*.pyc
