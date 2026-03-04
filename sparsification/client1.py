@@ -43,8 +43,9 @@ NORM_STD = [0.2023, 0.1994, 0.2010]
 
 ############################################# 수정 가능 #############################################
 local_epochs = 1
-lr = 0.1
+lr = 0.01
 batch_size = 128
+local_steps = 1
 host_ip = "127.0.0.1"
 port = 8081
 client_id = 1
@@ -56,7 +57,7 @@ train_transform = v2.Compose([
     v2.Resize((IMG_SIZE, IMG_SIZE)),
     # v2.RandomHorizontalFlip(0.5),
     v2.ToDtype(torch.float32, scale=True),
-    # v2.Normalize(mean=NORM_MEAN, std=NORM_STD)
+    v2.Normalize(mean=NORM_MEAN, std=NORM_STD)
 ])
 
 
@@ -113,29 +114,46 @@ def train(model, criterion, optimizer, train_loader):
 
 ##############################################################################################################################
 
-def compute_fedsgd_gradient(model, criterion, train_loader):
+def compute_fedsgd_gradient(model, criterion, train_loader, train_iter, local_steps=1):
     model.train()
     model.to(device)
     model.zero_grad(set_to_none=True)
+    steps = max(1, int(local_steps))
 
-    num_batches = len(train_loader)
-    if num_batches == 0:
-        raise ValueError("Empty train_loader")
+    running_loss = 0.0
+    running_corrects = 0
+    total = 0
 
-    for images, labels in tqdm(train_loader, desc="FedSGD Grad"):
+    for _ in range(steps):
+        try:
+            images, labels = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_loader)
+            images, labels = next(train_iter)
+
         images = images.to(device)
         labels = labels.to(device)
         outputs = model(images)
-        # 평균 gradient를 만들기 위해 배치 손실을 배치 수로 나눠 누적
-        loss = criterion(outputs, labels) / num_batches
+        batch_loss = criterion(outputs, labels)
+        running_loss += batch_loss.item()
+        running_corrects += (outputs.argmax(dim=1) == labels).sum().item()
+        total += labels.size(0)
+        # Average over local mini-batch steps before sending to server.
+        loss = batch_loss / steps
         loss.backward()
+
+    epoch_loss = running_loss / steps
+    epoch_accuracy = (100.0 * running_corrects / total) if total > 0 else 0.0
+    print(
+        f"FedSGD Local ({steps} step) => Loss: {epoch_loss:.4f} | Accuracy: {epoch_accuracy:.2f}%"
+    )
 
     grads = {}
     for name, param in model.named_parameters():
         if param.grad is None:
             continue
         grads[name] = param.grad.detach().cpu().clone()
-    return grads
+    return grads, train_iter
 
 
 
@@ -194,6 +212,7 @@ def main():
     client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     client.connect((host_ip, port))
     round_idx = 0
+    train_iter = iter(train_loader)
 
     while True:
         data_size = struct.unpack('>I', client.recv(4))[0]
@@ -221,7 +240,9 @@ def main():
         model_state_at_grad = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
         # model = train(model, criterion, optimizer, train_loader)
-        fedsgd_grads = compute_fedsgd_gradient(model, criterion, train_loader)
+        fedsgd_grads, train_iter = compute_fedsgd_gradient(
+            model, criterion, train_loader, train_iter, local_steps
+        )
 
         round_idx += 1
         # payload = {

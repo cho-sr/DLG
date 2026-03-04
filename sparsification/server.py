@@ -39,10 +39,10 @@ DATASET_ROOT = "./dataset"
 
 ####################################################### 수정 가능 #######################################################
 target_accuracy = 90.0  # 사용자 편의에 맞게 조정 (70~80 범위)
-global_round = 5   # 사용자 편의에 맞게 조정
-batch_size = 64  # 사용자 편의에 맞게 조정
+global_round = 10   # 사용자 편의에 맞게 조정
+batch_size = 128  # 사용자 편의에 맞게 조정
 num_samples = 1280   # 사용자 편의에 맞게 조정
-server_lr = 0.1  # FedSGD 서버 업데이트 학습률
+server_lr = 0.01  # FedSGD 서버 업데이트 학습률
 host = '127.0.0.1' # loop back으로 연합학습 수행 시 사용될 ip
 port = 8081 # 1024번 ~ 65535번
 DLG_RECORD_DIR = Path(__file__).resolve().parent / "dlg_records"
@@ -53,7 +53,7 @@ test_transform = v2.Compose([
     v2.ToImage(),
     v2.Resize((IMG_SIZE, IMG_SIZE)),
     v2.ToDtype(torch.float32, scale=True),
-    # v2.Normalize(mean=[0.4914, 0.4822, 0.4465],std=[0.2023, 0.1994, 0.2010])
+    v2.Normalize(mean=[0.4914, 0.4822, 0.4465],std=[0.2023, 0.1994, 0.2010])
 ])
 
 def build_model():
