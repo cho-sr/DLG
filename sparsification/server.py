@@ -42,6 +42,7 @@ target_accuracy = 90.0  # 사용자 편의에 맞게 조정 (70~80 범위)
 global_round = 5   # 사용자 편의에 맞게 조정
 batch_size = 64  # 사용자 편의에 맞게 조정
 num_samples = 1280   # 사용자 편의에 맞게 조정
+server_lr = 0.1  # FedSGD 서버 업데이트 학습률
 host = '127.0.0.1' # loop back으로 연합학습 수행 시 사용될 ip
 port = 8081 # 1024번 ~ 65535번
 DLG_RECORD_DIR = Path(__file__).resolve().parent / "dlg_records"
@@ -54,10 +55,6 @@ test_transform = v2.Compose([
     v2.ToDtype(torch.float32, scale=True),
     # v2.Normalize(mean=[0.4914, 0.4822, 0.4465],std=[0.2023, 0.1994, 0.2010])
 ])
-
-
-
-
 
 def build_model():
     model = LeNet()
@@ -118,7 +115,8 @@ def measure_accuracy(global_model, test_loader):
 
 ####################################################### 수정 금지 ##############################################################
 cnt = []
-model_list = []  # 수신받은 model 저장할 리스트
+# model_list = []  # (FedAvg) 수신받은 model 저장할 리스트
+grad_list = []  # (FedSGD) 수신받은 gradient 저장할 리스트
 semaphore = threading.Semaphore(0)
 
 global_model = None
@@ -132,7 +130,7 @@ elif torch.cuda.is_available():
 else:
     device = "cpu"
 def handle_client(conn, addr, model, test_loader):
-    global model_list, global_model, global_accuracy, global_model_size, current_round, cnt
+    global grad_list, global_model, global_accuracy, global_model_size, current_round, cnt
     print(f"Connected by {addr}")
 
     while True:
@@ -150,8 +148,11 @@ def handle_client(conn, addr, model, test_loader):
             received_payload += conn.recv(remaining_payload_size)
             remaining_payload_size = data_size - len(received_payload)
         received = pickle.loads(received_payload)
-        if isinstance(received, dict) and "model_state" in received:
-            model = received["model_state"]
+        # if isinstance(received, dict) and "model_state" in received:
+        #     model = received["model_state"]
+        if isinstance(received, dict) and "grads" in received:
+            client_grad = received["grads"]
+            num_client_samples = int(received.get("num_samples", 1))
 
             attack = received.get("attack")
             round_idx = int(received.get("round", 0))
@@ -169,18 +170,30 @@ def handle_client(conn, addr, model, test_loader):
                     gt_data=attack.get("gt_data"),
                     gt_label=attack.get("gt_label"),
                 )
+            grad_list.append(
+                {
+                    "client_id": client_id,
+                    "num_samples": num_client_samples,
+                    "grads": client_grad,
+                }
+            )
         else:
-            model = received
+            # model = received
+            raise ValueError("Expected FedSGD payload with 'grads'.")
 
-        model_list.append(model)
-        # print(models)
-        if len(model_list) == 2:
+        # model_list.append(model)
+        # if len(model_list) == 2:
+        if len(grad_list) == 2:
             current_round += 1
-            global_model = average_models(model_list)
-            global_accuracy, global_model, _ = measure_accuracy(global_model, test_loader)
+            apply_fedsgd_update(global_model, grad_list, server_lr)
+            global_accuracy, global_model, _ = measure_accuracy(
+                dict(global_model.state_dict().items()),
+                test_loader,
+            )
             print(f"Global round [{current_round} / {global_round}] Accuracy : {global_accuracy}%")
             global_model_size = get_model_size(global_model)
-            model_list = []
+            # model_list = []
+            grad_list = []
             semaphore.release()
         else:
             semaphore.acquire()
@@ -195,6 +208,31 @@ def handle_client(conn, addr, model, test_loader):
             weight = pickle.dumps(dict(global_model.state_dict().items()))
             conn.send(struct.pack('>I', len(weight)))
             conn.send(weight)
+
+def apply_fedsgd_update(model, client_grads, lr):
+    total_samples = sum(max(1, int(item.get("num_samples", 1))) for item in client_grads)
+    if total_samples <= 0:
+        return
+
+    # 가중 평균 gradient 계산
+    avg_grads = {}
+    for item in client_grads:
+        weight = max(1, int(item.get("num_samples", 1))) / float(total_samples)
+        grads = item["grads"]
+        for key, grad in grads.items():
+            grad_cpu = grad.detach().cpu()
+            if key not in avg_grads:
+                avg_grads[key] = grad_cpu * weight
+            else:
+                avg_grads[key] += grad_cpu * weight
+
+    # 서버 파라미터 직접 업데이트 (FedSGD)
+    with torch.no_grad():
+        for key, param in model.state_dict().items():
+            if key not in avg_grads:
+                continue
+            grad = avg_grads[key].to(param.device, dtype=param.dtype)
+            param.sub_(lr * grad)
 
 def save_attack_record(
     round_idx,
@@ -281,6 +319,8 @@ def main():
     )
 
     model = build_model().to(device)
+    global global_model
+    global_model = model
     ####################################################################
 
     print(f"Server is listening on {host}:{port}")

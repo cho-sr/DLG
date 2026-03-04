@@ -113,6 +113,30 @@ def train(model, criterion, optimizer, train_loader):
 
 ##############################################################################################################################
 
+def compute_fedsgd_gradient(model, criterion, train_loader):
+    model.train()
+    model.to(device)
+    model.zero_grad(set_to_none=True)
+
+    num_batches = len(train_loader)
+    if num_batches == 0:
+        raise ValueError("Empty train_loader")
+
+    for images, labels in tqdm(train_loader, desc="FedSGD Grad"):
+        images = images.to(device)
+        labels = labels.to(device)
+        outputs = model(images)
+        # 평균 gradient를 만들기 위해 배치 손실을 배치 수로 나눠 누적
+        loss = criterion(outputs, labels) / num_batches
+        loss.backward()
+
+    grads = {}
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        grads[name] = param.grad.detach().cpu().clone()
+    return grads
+
 
 
 ####################################################### 수정 가능 ##############################################################
@@ -196,14 +220,32 @@ def main():
         attack_grad = extract_attack_gradient(model, attack_x, attack_y)
         model_state_at_grad = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
-        model = train(model, criterion, optimizer, train_loader)
+        # model = train(model, criterion, optimizer, train_loader)
+        fedsgd_grads = compute_fedsgd_gradient(model, criterion, train_loader)
 
         round_idx += 1
+        # payload = {
+        #     "type": "client_update",
+        #     "client_id": client_id,
+        #     "round": round_idx,
+        #     "model_state": dict(model.state_dict().items()),
+        #     "attack": {
+        #         "num_classes": NUM_CLASSES,
+        #         "input_shape": tuple(attack_x.shape),
+        #         "norm_mean": list(NORM_MEAN),
+        #         "norm_std": list(NORM_STD),
+        #         "gradients": attack_grad,
+        #         "model_state": model_state_at_grad,
+        #         "gt_data": attack_x.detach().cpu().clone(),
+        #         "gt_label": int(attack_y.item()),
+        #     },
+        # }
         payload = {
-            "type": "client_update",
+            "type": "client_grad",
             "client_id": client_id,
             "round": round_idx,
-            "model_state": dict(model.state_dict().items()),
+            "num_samples": len(train_dataset),
+            "grads": fedsgd_grads,
             "attack": {
                 "num_classes": NUM_CLASSES,
                 "input_shape": tuple(attack_x.shape),
