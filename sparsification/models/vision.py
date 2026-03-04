@@ -7,9 +7,9 @@ from torchvision import models, datasets, transforms
 
 
 def weights_init(m):
-    if hasattr(m, "weight"):
+    if hasattr(m, "weight") and m.weight is not None:
         m.weight.data.uniform_(-0.5, 0.5)
-    if hasattr(m, "bias"):
+    if hasattr(m, "bias") and m.bias is not None:
         m.bias.data.uniform_(-0.5, 0.5)
         
 class LeNet(nn.Module):
@@ -50,9 +50,9 @@ import torch.nn.functional as F
 
 
 def weights_init(m):
-    if hasattr(m, "weight"):
+    if hasattr(m, "weight") and m.weight is not None:
         m.weight.data.uniform_(-0.5, 0.5)
-    if hasattr(m, "bias"):
+    if hasattr(m, "bias") and m.bias is not None:
         m.bias.data.uniform_(-0.5, 0.5)
 
 class BasicBlock(nn.Module):
@@ -73,10 +73,10 @@ class BasicBlock(nn.Module):
             )
 
     def forward(self, x):
-        out = F.Sigmoid(self.bn1(self.conv1(x)))
+        out = F.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
         out += self.shortcut(x)
-        out = F.Sigmoid(out)
+        out = F.relu(out)
         return out
 
 
@@ -100,11 +100,11 @@ class Bottleneck(nn.Module):
             )
 
     def forward(self, x):
-        out = F.Sigmoid(self.bn1(self.conv1(x)))
-        out = F.Sigmoid(self.bn2(self.conv2(out)))
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = F.relu(self.bn2(self.conv2(out)))
         out = self.bn3(self.conv3(out))
         out += self.shortcut(x)
-        out = F.Sigmoid(out)
+        out = F.relu(out)
         return out
 
 
@@ -130,19 +130,19 @@ class ResNet(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        out = F.Sigmoid(self.bn1(self.conv1(x)))
+        out = F.relu(self.bn1(self.conv1(x)))
         out = self.layer1(out)
         out = self.layer2(out)
         out = self.layer3(out)
         out = self.layer4(out)
-        out = F.avg_pool2d(out, 4)
+        out = F.adaptive_avg_pool2d(out, (1,1))
         out = out.view(out.size(0), -1)
         out = self.linear(out)
         return out
 
 
-def ResNet18():
-    return ResNet(BasicBlock, [2,2,2,2])
+def ResNet18(num_classes=100):
+    return ResNet(BasicBlock, [2,2,2,2], num_classes=num_classes)
 
 def ResNet34():
     return ResNet(BasicBlock, [3,4,6,3])

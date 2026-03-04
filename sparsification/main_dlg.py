@@ -23,12 +23,15 @@ parser.add_argument('--image', type=str,default="",
                     help='the path to customized image.')
 args = parser.parse_args()
 
-device = "cpu"
 if torch.cuda.is_available():
     device = "cuda"
+elif torch.backends.mps.is_available():
+    device = "mps"
+else:
+    device = "cpu"
 print("Running on %s" % device)
 
-dst = datasets.CIFAR100("~/.torch", download=True)
+dst = datasets.CIFAR10("~/.torch", download=True)
 tp = transforms.ToTensor()
 tt = transforms.ToPILImage()
 
@@ -43,12 +46,13 @@ if len(args.image) > 1:
 gt_data = gt_data.view(1, *gt_data.size())
 gt_label = torch.Tensor([dst[img_index][1]]).long().to(device)
 gt_label = gt_label.view(1, )
-gt_onehot_label = label_to_onehot(gt_label)
+num_classes = len(dst.classes)
+gt_onehot_label = label_to_onehot(gt_label, num_classes=num_classes)
 
 plt.imshow(tt(gt_data[0].cpu()))
 
-from models.vision import LeNet, weights_init
-net = LeNet().to(device)
+from models.vision import ResNet18, weights_init
+net = ResNet18(num_classes=num_classes).to(device)
 
 
 torch.manual_seed(1234)

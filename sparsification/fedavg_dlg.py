@@ -279,6 +279,11 @@ def dlg_attack(model, target_gradients, gt_shape, label_shape, iters, device, gt
                                   lr=1.0,
                                   history_size=100,
                                   max_iter=20)
+    print("\n[LBFGS defaults (after setting paper params)]")
+    print(optimizer.defaults)
+    print("\n[LBFGS param_group[0] (after setting paper params)]")
+    for k in ["lr", "max_iter", "history_size", "line_search_fn"]:
+        print(f"  {k}: {optimizer.param_groups[0].get(k, optimizer.defaults.get(k))}")
 
     progress_snapshots = []
     loss_history = []
