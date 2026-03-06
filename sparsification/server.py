@@ -19,7 +19,6 @@ from torchvision import models
 from torchvision import datasets
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms.v2 as v2
-from models.vision import LeNet
 warnings.filterwarnings("ignore")
 
 SEED = 42
@@ -57,10 +56,46 @@ test_transform = v2.Compose([
 ])
 
 def build_model():
-    model = LeNet()
-    if NUM_CLASSES != 10:
-        model.fc[0] = nn.Linear(model.fc[0].in_features, NUM_CLASSES)
-    return model
+    return Network1(num_classes=NUM_CLASSES)
+
+
+class Network1(nn.Module):
+    def __init__(self, num_classes=10):
+        super(Network1, self).__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 16, 3, stride=2, padding=1, bias=False),
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(16, 16, 3, padding=1, groups=16, bias=False),
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(16, 32, 1, bias=False),
+            nn.ReLU6(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 32, 3, padding=1, groups=32, bias=False),
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(32, 64, 1, bias=False),
+            nn.ReLU6(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(64, 64, 3, padding=1, groups=64, bias=False),
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(64, 128, 1, bias=False),
+            nn.ReLU6(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(128, 128, 3, padding=1, groups=128, bias=False),
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(128, 256, 1, bias=False),
+            nn.ReLU6(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.2),
+            nn.Conv2d(256, num_classes, kernel_size=1),
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.classifier(x)
+        x = x.view(x.size(0), -1)
+        return x
 
 
 class CustomDataset(Dataset):
@@ -319,8 +354,6 @@ def main():
     )
 
     model = build_model().to(device)
-    global global_model
-    global_model = model
     ####################################################################
 
     print(f"Server is listening on {host}:{port}")

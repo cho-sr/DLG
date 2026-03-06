@@ -15,10 +15,10 @@ from collections import OrderedDict
 import warnings
 import select
 import os
+from pathlib import Path
 from torchvision import models
 from torchvision import datasets
 import torchvision.transforms.v2 as v2
-from models.vision import LeNet
 from utils import label_to_onehot, cross_entropy_for_onehot
 
 warnings.filterwarnings("ignore")
@@ -44,11 +44,14 @@ NORM_STD = [0.2023, 0.1994, 0.2010]
 ############################################# 수정 가능 #############################################
 local_epochs = 1
 lr = 0.01
-batch_size = 128
-local_steps = 1
+batch_size = 1
+local_steps = 10
 host_ip = "127.0.0.1"
 port = 8081
 client_id = 1
+STANDALONE_MODE = True
+standalone_rounds = 30
+GRAD_RECORD_DIR = Path(__file__).resolve().parent / "client_grad_records"
 
 
 ################# 전처리 코드 수정 가능하나 꼭 IMG_SIZE로 resize한 뒤 정규화 해야 함#################
@@ -64,16 +67,62 @@ train_transform = v2.Compose([
 scaler = torch.amp.GradScaler('cuda')
 
 
+class Network1(nn.Module):
+    def __init__(self, num_classes=10):
+        super(Network1, self).__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 16, 3, stride=2, padding=1, bias=False),
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(16, 16, 3, padding=1, groups=16, bias=False),
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(16, 32, 1, bias=False),
+            nn.ReLU6(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 32, 3, padding=1, groups=32, bias=False),
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(32, 64, 1, bias=False),
+            nn.ReLU6(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(64, 64, 3, padding=1, groups=64, bias=False),
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(64, 128, 1, bias=False),
+            nn.ReLU6(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(128, 128, 3, padding=1, groups=128, bias=False),
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(128, 256, 1, bias=False),
+            nn.ReLU6(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.2),
+            nn.Conv2d(256, num_classes, kernel_size=1),
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.classifier(x)
+        x = x.view(x.size(0), -1)
+        return x
+
+
 def extract_attack_gradient(model, x, y):
     model.eval()
+    model.zero_grad(set_to_none=True)
+
     x = x.to(device)
     y = y.to(device)
-    y_onehot = label_to_onehot(y, num_classes=NUM_CLASSES)
 
     pred = model(x)
-    loss = cross_entropy_for_onehot(pred, y_onehot)
+    loss = F.cross_entropy(pred, y)
+
     dy_dx = torch.autograd.grad(loss, model.parameters())
-    return [g.detach().cpu().clone() for g in dy_dx]
+
+    grads_dict = {}
+    for (name, param), grad in zip(model.named_parameters(), dy_dx):
+        grads_dict[name] = grad.detach().cpu().clone()
+        
+    return grads_dict
 
 def train(model, criterion, optimizer, train_loader):
     model.to(device)
@@ -188,20 +237,14 @@ def main():
     rng = np.random.default_rng(SEED)
     rng.shuffle(indices)
 
-    half = len(indices) // 2
-    client_idx = indices[:half]   # client1 = 앞 절반
-    train_dataset = Subset(train_dataset, client_idx)
-
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True, num_workers=0
     )
 
-    model = LeNet()
-    if NUM_CLASSES != 10:
-        model.fc[0] = nn.Linear(model.fc[0].in_features, NUM_CLASSES)
+    model = Network1(num_classes=NUM_CLASSES)
     model = model.to(device)
     optimizer = torch.optim.SGD(model.parameters(), lr=lr, )
-    criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
+    criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.0)
 ##############################################################################################################################
 
 
@@ -209,10 +252,58 @@ def main():
 
 
 ########################################################### 수정 금지 2 ##############################################################
-    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    client.connect((host_ip, port))
     round_idx = 0
     train_iter = iter(train_loader)
+
+    if STANDALONE_MODE:
+        GRAD_RECORD_DIR.mkdir(parents=True, exist_ok=True)
+        print(f"Standalone mode enabled. Saving records to: {GRAD_RECORD_DIR}")
+
+        for _ in range(standalone_rounds):
+            round_idx += 1
+# 1. 공격 타겟 데이터 선정 (정규화된 상태 확인)
+            sample_idx = indices[round_idx % len(indices)] # 셔플된 인덱스 활용
+            attack_x, attack_y = train_dataset[sample_idx]
+            attack_x = attack_x.unsqueeze(0).to(device)
+            attack_y = torch.tensor([int(attack_y)], dtype=torch.long).to(device)
+
+            # 2. 핵심: 그래디언트 추출 당시의 모델 가중치(W) 저장
+            # 이 W를 기준으로 공격자가 더미 그래디언트를 계산하게 됨
+            model_state_at_grad = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+            # 3. 깨끗한 1개 샘플 그래디언트 추출
+            attack_grad = extract_attack_gradient(model, attack_x, attack_y)
+
+            # 4. 실제 학습 진행 (FedSGD 누적 그래디언트)
+            # 이 과정은 model 가중치를 직접 바꾸지 않고 param.grad만 채움
+            fedsgd_grads, train_iter = compute_fedsgd_gradient(
+                model, criterion, train_loader, train_iter, local_steps
+            )
+
+            payload = {
+                "type": "client_grad",
+                "client_id": client_id,
+                "round": round_idx,
+                "num_samples": 1, 
+                "fedsgd_grads": fedsgd_grads, # 실제 전송되는 정보
+                "attack": {
+                    "num_classes": NUM_CLASSES,
+                    "input_shape": tuple(attack_x.shape),
+                    "norm_mean": list(NORM_MEAN),
+                    "norm_std": list(NORM_STD),
+                    "gradients": attack_grad,
+                    "model_state": model_state_at_grad,
+                    "gt_data": attack_x.detach().cpu().clone(),
+                    "gt_label": int(attack_y.item()),
+                },
+            }
+            out_path = GRAD_RECORD_DIR / f"round_{round_idx:03d}_client_{client_id}.pt"
+            torch.save(payload, out_path)
+            print(f"Saved local gradient record: {out_path.name}")
+        return
+
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client.connect((host_ip, port))
 
     while True:
         data_size = struct.unpack('>I', client.recv(4))[0]
