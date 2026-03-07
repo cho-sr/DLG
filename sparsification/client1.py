@@ -23,6 +23,7 @@ from utils import label_to_onehot, cross_entropy_for_onehot
 
 warnings.filterwarnings("ignore")
 
+
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
