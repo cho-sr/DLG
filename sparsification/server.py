@@ -14,9 +14,7 @@ import copy
 import warnings
 import random
 import os
-from pathlib import Path
 from torchvision import models
-from torchvision import datasets
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms.v2 as v2
 warnings.filterwarnings("ignore")
@@ -31,70 +29,83 @@ torch.backends.cudnn.benchmark = False
 test_loader = None
 
 ############################################## 수정 불가 1 ##############################################
-IMG_SIZE = 32
-NUM_CLASSES = 10
-DATASET_ROOT = "./dataset"
+IMG_SIZE = 192
+NUM_CLASSES = 4
+DATASET_NAME = "./dataset/test.pt"
 ######################################################################################################
 
 ####################################################### 수정 가능 #######################################################
 target_accuracy = 90.0  # 사용자 편의에 맞게 조정 (70~80 범위)
-global_round = 10   # 사용자 편의에 맞게 조정
-batch_size = 128  # 사용자 편의에 맞게 조정
+global_round = 5   # 사용자 편의에 맞게 조정
+batch_size = 64  # 사용자 편의에 맞게 조정
 num_samples = 1280   # 사용자 편의에 맞게 조정
-server_lr = 0.01  # FedSGD 서버 업데이트 학습률
 host = '127.0.0.1' # loop back으로 연합학습 수행 시 사용될 ip
 port = 8081 # 1024번 ~ 65535번
-DLG_RECORD_DIR = Path(__file__).resolve().parent / "dlg_records"
-DLG_SAVE_ROUNDS = {5, 10, 15, 20, 25, 30}
 
 
 test_transform = v2.Compose([
-    v2.ToImage(),
     v2.Resize((IMG_SIZE, IMG_SIZE)),
     v2.ToDtype(torch.float32, scale=True),
-    v2.Normalize(mean=[0.4914, 0.4822, 0.4465],std=[0.2023, 0.1994, 0.2010])
+    v2.Normalize(mean=[0.485, 0.456, 0.406],
+                 std=[0.229, 0.224, 0.225]),
 ])
 
-def build_model():
-    return Network1(num_classes=NUM_CLASSES)
+
+
 
 
 class Network1(nn.Module):
-    def __init__(self, num_classes=10):
+    def __init__(self, num_classes=4):
         super(Network1, self).__init__()
         self.features = nn.Sequential(
             nn.Conv2d(3, 16, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(16),
             nn.ReLU6(inplace=True),
+
             nn.Conv2d(16, 16, 3, padding=1, groups=16, bias=False),
+            nn.BatchNorm2d(16),
             nn.ReLU6(inplace=True),
             nn.Conv2d(16, 32, 1, bias=False),
+            nn.BatchNorm2d(32),
             nn.ReLU6(inplace=True),
             nn.MaxPool2d(2),
+
             nn.Conv2d(32, 32, 3, padding=1, groups=32, bias=False),
+            nn.BatchNorm2d(32),
             nn.ReLU6(inplace=True),
             nn.Conv2d(32, 64, 1, bias=False),
+            nn.BatchNorm2d(64),
             nn.ReLU6(inplace=True),
             nn.MaxPool2d(2),
+
             nn.Conv2d(64, 64, 3, padding=1, groups=64, bias=False),
+            nn.BatchNorm2d(64),
             nn.ReLU6(inplace=True),
             nn.Conv2d(64, 128, 1, bias=False),
+            nn.BatchNorm2d(128),
             nn.ReLU6(inplace=True),
             nn.MaxPool2d(2),
+
             nn.Conv2d(128, 128, 3, padding=1, groups=128, bias=False),
+            nn.BatchNorm2d(128),
             nn.ReLU6(inplace=True),
             nn.Conv2d(128, 256, 1, bias=False),
+            nn.BatchNorm2d(256),
             nn.ReLU6(inplace=True),
-            nn.AdaptiveAvgPool2d(1),
+
+            nn.AdaptiveAvgPool2d(1)
         )
         self.classifier = nn.Sequential(
+            nn.BatchNorm2d(256),
             nn.Dropout(0.2),
-            nn.Conv2d(256, num_classes, kernel_size=1),
+            nn.Conv2d(256, num_classes,kernel_size=1)
         )
 
     def forward(self, x):
         x = self.features(x)
         x = self.classifier(x)
         x = x.view(x.size(0), -1)
+
         return x
 
 
@@ -117,8 +128,9 @@ class CustomDataset(Dataset):
         return x, y
 
 def measure_accuracy(global_model, test_loader):
-    model = build_model().to(device)
+    model = Network1().to(device)
     model.load_state_dict(global_model)
+    model.half()
     model.eval()
 
     accuracy = 0.0
@@ -129,7 +141,7 @@ def measure_accuracy(global_model, test_loader):
     with torch.no_grad():
         print("\n")
         for inputs, labels in tqdm(test_loader, desc="Test"):
-            inputs = inputs.to(device)
+            inputs = inputs.to(device).half()
             labels = labels.to(device)
             outputs = model(inputs)
             correct += (outputs.argmax(1) == labels).sum().item()
@@ -150,8 +162,7 @@ def measure_accuracy(global_model, test_loader):
 
 ####################################################### 수정 금지 ##############################################################
 cnt = []
-# model_list = []  # (FedAvg) 수신받은 model 저장할 리스트
-grad_list = []  # (FedSGD) 수신받은 gradient 저장할 리스트
+model_list = []  # 수신받은 model 저장할 리스트
 semaphore = threading.Semaphore(0)
 
 global_model = None
@@ -165,7 +176,7 @@ elif torch.cuda.is_available():
 else:
     device = "cpu"
 def handle_client(conn, addr, model, test_loader):
-    global grad_list, global_model, global_accuracy, global_model_size, current_round, cnt
+    global model_list, global_model, global_accuracy, global_model_size, current_round, cnt
     print(f"Connected by {addr}")
 
     while True:
@@ -182,53 +193,17 @@ def handle_client(conn, addr, model, test_loader):
         while remaining_payload_size != 0:
             received_payload += conn.recv(remaining_payload_size)
             remaining_payload_size = data_size - len(received_payload)
-        received = pickle.loads(received_payload)
-        # if isinstance(received, dict) and "model_state" in received:
-        #     model = received["model_state"]
-        if isinstance(received, dict) and "grads" in received:
-            client_grad = received["grads"]
-            num_client_samples = int(received.get("num_samples", 1))
+        model = pickle.loads(received_payload)
 
-            attack = received.get("attack")
-            round_idx = int(received.get("round", 0))
-            client_id = int(received.get("client_id", -1))
-            if isinstance(attack, dict) and round_idx in DLG_SAVE_ROUNDS and client_id > 0:
-                save_attack_record(
-                    round_idx=round_idx,
-                    client_id=client_id,
-                    gradients=attack.get("gradients"),
-                    model_state=attack.get("model_state"),
-                    num_classes=int(attack.get("num_classes", NUM_CLASSES)),
-                    input_shape=tuple(attack.get("input_shape", (1, 3, IMG_SIZE, IMG_SIZE))),
-                    norm_mean=attack.get("norm_mean"),
-                    norm_std=attack.get("norm_std"),
-                    gt_data=attack.get("gt_data"),
-                    gt_label=attack.get("gt_label"),
-                )
-            grad_list.append(
-                {
-                    "client_id": client_id,
-                    "num_samples": num_client_samples,
-                    "grads": client_grad,
-                }
-            )
-        else:
-            # model = received
-            raise ValueError("Expected FedSGD payload with 'grads'.")
-
-        # model_list.append(model)
-        # if len(model_list) == 2:
-        if len(grad_list) == 2:
+        model_list.append(model)
+        # print(models)
+        if len(model_list) == 2:
             current_round += 1
-            apply_fedsgd_update(global_model, grad_list, server_lr)
-            global_accuracy, global_model, _ = measure_accuracy(
-                dict(global_model.state_dict().items()),
-                test_loader,
-            )
+            global_model = average_models(model_list)
+            global_accuracy, global_model, _ = measure_accuracy(global_model, test_loader)
             print(f"Global round [{current_round} / {global_round}] Accuracy : {global_accuracy}%")
             global_model_size = get_model_size(global_model)
-            # model_list = []
-            grad_list = []
+            model_list = []
             semaphore.release()
         else:
             semaphore.acquire()
@@ -243,69 +218,6 @@ def handle_client(conn, addr, model, test_loader):
             weight = pickle.dumps(dict(global_model.state_dict().items()))
             conn.send(struct.pack('>I', len(weight)))
             conn.send(weight)
-
-def apply_fedsgd_update(model, client_grads, lr):
-    total_samples = sum(max(1, int(item.get("num_samples", 1))) for item in client_grads)
-    if total_samples <= 0:
-        return
-
-    # 가중 평균 gradient 계산
-    avg_grads = {}
-    for item in client_grads:
-        weight = max(1, int(item.get("num_samples", 1))) / float(total_samples)
-        grads = item["grads"]
-        for key, grad in grads.items():
-            grad_cpu = grad.detach().cpu()
-            if key not in avg_grads:
-                avg_grads[key] = grad_cpu * weight
-            else:
-                avg_grads[key] += grad_cpu * weight
-
-    # 서버 파라미터 직접 업데이트 (FedSGD)
-    with torch.no_grad():
-        for key, param in model.state_dict().items():
-            if key not in avg_grads:
-                continue
-            grad = avg_grads[key].to(param.device, dtype=param.dtype)
-            param.sub_(lr * grad)
-
-def save_attack_record(
-    round_idx,
-    client_id,
-    gradients,
-    model_state,
-    num_classes,
-    input_shape,
-    norm_mean=None,
-    norm_std=None,
-    gt_data=None,
-    gt_label=None,
-):
-    if gradients is None or model_state is None:
-        return
-
-    DLG_RECORD_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = DLG_RECORD_DIR / f"round_{int(round_idx):03d}_client_{int(client_id)}.pt"
-
-    payload = {
-        "round": int(round_idx),
-        "client_id": int(client_id),
-        "num_classes": int(num_classes),
-        "input_shape": tuple(input_shape),
-        "gradients": [g.detach().cpu().clone() for g in gradients],
-        "model_state": {k: v.detach().cpu().clone() for k, v in model_state.items()},
-    }
-    if norm_mean is not None:
-        payload["norm_mean"] = list(norm_mean)
-    if norm_std is not None:
-        payload["norm_std"] = list(norm_std)
-    if gt_data is not None:
-        payload["gt_data"] = gt_data.detach().cpu().clone()
-    if gt_label is not None:
-        payload["gt_label"] = int(gt_label)
-
-    torch.save(payload, out_path)
-    print(f"[DLG] Saved gradient record: {out_path.name}")
 
 def get_model_size(global_model):
     model_size = len(pickle.dumps(dict(global_model.state_dict().items())))
@@ -342,18 +254,13 @@ def main():
     address = []
 
     ############################ 수정 가능 ############################
-    train_dataset = datasets.CIFAR10(
-        root=DATASET_ROOT,
-        train=False,
-        download=True,
-        transform=test_transform,
-    )
+    train_dataset = CustomDataset(DATASET_NAME, is_train=False, transform=test_transform)
 
     test_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=batch_size, shuffle=False, num_workers=0
     )
 
-    model = build_model().to(device)
+    model = Network1().half().to(device)
     ####################################################################
 
     print(f"Server is listening on {host}:{port}")
