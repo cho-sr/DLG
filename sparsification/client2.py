@@ -16,7 +16,9 @@ import warnings
 import select
 import os
 from torchvision import models
+from torchvision import datasets
 import torchvision.transforms.v2 as v2
+from models.vision import LeNet
 warnings.filterwarnings("ignore")
 
 SEED = 42
@@ -29,9 +31,14 @@ torch.backends.cudnn.benchmark = False
 
 
 ############################################## 수정 금지 1 ##############################################
-IMG_SIZE = 192
-NUM_CLASSES = 4
-DATASET_NAME = "./dataset/client2.pt"
+IMG_SIZE = 32
+NUM_CLASSES = 10
+DATASET_ROOT = "./dataset"
+# =========================================================
+# [추가할 부분] DLG 페이로드 구성을 위한 정규화 상수 추가
+# =========================================================
+NORM_MEAN = [0.4914, 0.4822, 0.4465]
+NORM_STD = [0.2023, 0.1994, 0.2010]
 ######################################################################################################
 
 
@@ -39,72 +46,33 @@ DATASET_NAME = "./dataset/client2.pt"
 local_epochs = 1
 lr = 0.001
 batch_size = 32
+client_id = 2
 host_ip = "127.0.0.1"
 port = 8081
 
 
 ################# 전처리 코드 수정 가능하나 꼭 IMG_SIZE로 resize한 뒤 정규화 해야 함 #################
 train_transform = v2.Compose([
+    v2.ToImage(),
     v2.Resize((IMG_SIZE, IMG_SIZE)),
     v2.RandomHorizontalFlip(0.5),
     v2.ToDtype(torch.float32, scale=True),
-    v2.Normalize(mean=[0.485, 0.456, 0.406],
-                 std=[0.229, 0.224, 0.225]),
+    v2.Normalize(mean=[0.4914, 0.4822, 0.4465],
+                 std=[0.2023, 0.1994, 0.2010]),
 ])
 
+attack_transform = v2.Compose([
+    v2.ToImage(),
+    v2.Resize((IMG_SIZE, IMG_SIZE)),
+    v2.ToDtype(torch.float32, scale=True),
+    v2.Normalize(mean=NORM_MEAN, std=NORM_STD),
+])
 
-class Network1(nn.Module):
-    def __init__(self, num_classes=4):
-        super(Network1, self).__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 16, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(16),
-            nn.ReLU6(inplace=True),
-
-            nn.Conv2d(16, 16, 3, padding=1, groups=16, bias=False),
-            nn.BatchNorm2d(16),
-            nn.ReLU6(inplace=True),
-            nn.Conv2d(16, 32, 1, bias=False),
-            nn.BatchNorm2d(32),
-            nn.ReLU6(inplace=True),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(32, 32, 3, padding=1, groups=32, bias=False),
-            nn.BatchNorm2d(32),
-            nn.ReLU6(inplace=True),
-            nn.Conv2d(32, 64, 1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU6(inplace=True),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(64, 64, 3, padding=1, groups=64, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU6(inplace=True),
-            nn.Conv2d(64, 128, 1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.ReLU6(inplace=True),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(128, 128, 3, padding=1, groups=128, bias=False),
-            nn.BatchNorm2d(128),
-            nn.ReLU6(inplace=True),
-            nn.Conv2d(128, 256, 1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.ReLU6(inplace=True),
-
-            nn.AdaptiveAvgPool2d(1)
-        )
-        self.classifier = nn.Sequential(
-            nn.BatchNorm2d(256),
-            nn.Dropout(0.2),
-            nn.Conv2d(256, num_classes,kernel_size=1)
-        )
-
-    def forward(self, x):
-        x = self.features(x)
-        x = self.classifier(x)
-        x = x.view(x.size(0), -1)
-        return x
+def build_model():
+    model = LeNet()
+    if NUM_CLASSES != 10:
+        model.fc[0] = nn.Linear(model.fc[0].in_features, NUM_CLASSES)
+    return model
 
 
 scaler = torch.amp.GradScaler('cuda')
@@ -148,6 +116,62 @@ def train(model, criterion, optimizer, train_loader):
 
 ##############################################################################################################################
 
+# client1.py의 compute_fedsgd_gradient 내부
+
+def compute_fedsgd_gradient(
+    model,
+    criterion,
+    train_loader,
+    attack_criterion,
+    attack_x,
+    attack_y,
+    attack_global_index,
+):
+    model.train()
+    model.to(device)
+    model.zero_grad(set_to_none=True)
+
+    # -------------------------------------------------------------
+    # 1. 정상적인 글로벌 모델 업데이트를 위한 "전체 배치 평균 그래디언트"
+    # -------------------------------------------------------------
+    for images, labels in tqdm(train_loader, desc="FedSGD Grad"):
+        images, labels = images.to(device), labels.to(device)
+        outputs = model(images)
+        loss = criterion(outputs, labels) / len(train_loader)
+        loss.backward()
+
+    # 정상 통신용 그래디언트 저장
+    fedsgd_grads = {name: param.grad.detach().cpu().clone() 
+                    for name, param in model.named_parameters() if param.grad is not None}
+    fedsgd_buffers = {name: buf.detach().cpu().clone() 
+                      for name, buf in model.named_buffers()}
+
+    # -------------------------------------------------------------
+    # 2. [몰래 끼워넣기] DLG 공격을 당할 불운한 "1장의 타겟 이미지" 연산
+    # -------------------------------------------------------------
+    model.zero_grad(set_to_none=True)
+    attack_x = attack_x.to(device)
+    attack_y = attack_y.to(device)
+    model_state_at_grad = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    attack_outputs = model(attack_x)
+    attack_loss = attack_criterion(attack_outputs, attack_y)
+    attack_loss.backward()
+
+    attack_payload = {
+        "global_index": int(attack_global_index),
+        "num_classes": NUM_CLASSES,
+        "input_shape": tuple(attack_x.shape),
+        "norm_mean": list(NORM_MEAN),
+        "norm_std": list(NORM_STD),
+        "gradients": [param.grad.detach().cpu().clone() for param in model.parameters()],
+        "model_state": model_state_at_grad,
+        "gt_data": attack_x.detach().cpu().clone(),
+        "gt_label": int(attack_y.item()),
+    }
+
+    return fedsgd_grads, fedsgd_buffers, attack_payload
+
 
 
 ####################################################### 수정 가능 ##############################################################
@@ -171,16 +195,37 @@ class CustomDataset(Dataset):
         return x, y
 
 def main():
-    train_dataset = CustomDataset(DATASET_NAME, is_train=True, transform=train_transform)
+    train_dataset = datasets.CIFAR10(
+        root=DATASET_ROOT,
+        train=True,
+        download=True,
+        transform=train_transform,
+    )
+    indices = np.arange(len(train_dataset))
+    rng = np.random.default_rng(SEED)
+    rng.shuffle(indices)
+
+    half = len(indices) // 2
+    client_idx = indices[half:]
+    train_dataset = Subset(train_dataset, client_idx)
+    attack_dataset = datasets.CIFAR10(
+        root=DATASET_ROOT,
+        train=True,
+        download=True,
+        transform=attack_transform,
+    )
+    attack_global_index = int(np.min(client_idx))
+    attack_x, attack_y = attack_dataset[attack_global_index]
+    attack_x = attack_x.unsqueeze(0)
+    attack_y = torch.tensor([int(attack_y)], dtype=torch.long)
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True, num_workers=0
     )
 
-    model = Network1().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
-    class_weights = torch.tensor([3.1, 4.0, 2.5, 3.3]).to(device)
-    criterion = torch.nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
+    model = build_model().to(device)
+    criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
+    attack_criterion = torch.nn.CrossEntropyLoss()
 ##############################################################################################################################
 
 
@@ -210,13 +255,35 @@ def main():
             print("Federated Learning finished")
             break
 
-        model = train(model, criterion, optimizer, train_loader)
+# =================================================================
+        # [수정 전] 에러가 나던 부분
+        # grads, buffers, actual_num_samples = compute_fedsgd_gradient(...)
+        # =================================================================
+        
+        fedsgd_grads, fedsgd_buffers, attack_payload = compute_fedsgd_gradient(
+            model,
+            criterion,
+            train_loader,
+            attack_criterion,
+            attack_x,
+            attack_y,
+            attack_global_index,
+        )
 
-        model_data = pickle.dumps(dict(model.state_dict().items()))
+        # 그 후 페이로드를 구성할 때 받아온 변수들을 그대로 사용합니다.
+        payload = {
+            "type": "client_grad",
+            "client_id": client_id,
+            "num_samples": len(train_dataset), # 정상 학습을 위해 전체 데이터 수 전송
+            "grads": fedsgd_grads,             # 정상적인 평균 그래디언트
+            "buffers": fedsgd_buffers,         # 정상적인 BatchNorm 통계량
+            "attack": attack_payload,
+        }
+        
+        model_data = pickle.dumps(payload)
         client.sendall(struct.pack('>I', len(model_data)))
         client.sendall(model_data)
-
-        print("Sent updated local model to server.")
+        print("Sent local gradients to server.")
 
 
 if __name__ == "__main__":

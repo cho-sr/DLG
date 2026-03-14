@@ -14,9 +14,12 @@ import copy
 import warnings
 import random
 import os
+from pathlib import Path
 from torchvision import models
+from torchvision import datasets
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms.v2 as v2
+from models.vision import LeNet
 warnings.filterwarnings("ignore")
 
 SEED = 42
@@ -29,9 +32,9 @@ torch.backends.cudnn.benchmark = False
 test_loader = None
 
 ############################################## 수정 불가 1 ##############################################
-IMG_SIZE = 192
-NUM_CLASSES = 4
-DATASET_NAME = "./dataset/test.pt"
+IMG_SIZE = 32
+NUM_CLASSES = 10
+DATASET_ROOT = "./dataset"
 ######################################################################################################
 
 ####################################################### 수정 가능 #######################################################
@@ -39,74 +42,28 @@ target_accuracy = 90.0  # 사용자 편의에 맞게 조정 (70~80 범위)
 global_round = 5   # 사용자 편의에 맞게 조정
 batch_size = 64  # 사용자 편의에 맞게 조정
 num_samples = 1280   # 사용자 편의에 맞게 조정
+server_lr = 0.01
 host = '127.0.0.1' # loop back으로 연합학습 수행 시 사용될 ip
 port = 8081 # 1024번 ~ 65535번
+GRAD_RECORD_DIR = Path(__file__).resolve().parent / "gradient_records"
+GRAD_SAVE_ROUNDS = {5}
+NORM_MEAN = [0.4914, 0.4822, 0.4465]
+NORM_STD = [0.2023, 0.1994, 0.2010]
 
 
 test_transform = v2.Compose([
+    v2.ToImage(),
     v2.Resize((IMG_SIZE, IMG_SIZE)),
     v2.ToDtype(torch.float32, scale=True),
-    v2.Normalize(mean=[0.485, 0.456, 0.406],
-                 std=[0.229, 0.224, 0.225]),
+    v2.Normalize(mean=NORM_MEAN,
+                 std=NORM_STD),
 ])
 
-
-
-
-
-class Network1(nn.Module):
-    def __init__(self, num_classes=4):
-        super(Network1, self).__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 16, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(16),
-            nn.ReLU6(inplace=True),
-
-            nn.Conv2d(16, 16, 3, padding=1, groups=16, bias=False),
-            nn.BatchNorm2d(16),
-            nn.ReLU6(inplace=True),
-            nn.Conv2d(16, 32, 1, bias=False),
-            nn.BatchNorm2d(32),
-            nn.ReLU6(inplace=True),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(32, 32, 3, padding=1, groups=32, bias=False),
-            nn.BatchNorm2d(32),
-            nn.ReLU6(inplace=True),
-            nn.Conv2d(32, 64, 1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU6(inplace=True),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(64, 64, 3, padding=1, groups=64, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU6(inplace=True),
-            nn.Conv2d(64, 128, 1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.ReLU6(inplace=True),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(128, 128, 3, padding=1, groups=128, bias=False),
-            nn.BatchNorm2d(128),
-            nn.ReLU6(inplace=True),
-            nn.Conv2d(128, 256, 1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.ReLU6(inplace=True),
-
-            nn.AdaptiveAvgPool2d(1)
-        )
-        self.classifier = nn.Sequential(
-            nn.BatchNorm2d(256),
-            nn.Dropout(0.2),
-            nn.Conv2d(256, num_classes,kernel_size=1)
-        )
-
-    def forward(self, x):
-        x = self.features(x)
-        x = self.classifier(x)
-        x = x.view(x.size(0), -1)
-
-        return x
+def build_model():
+    model = LeNet()
+    if NUM_CLASSES != 10:
+        model.fc[0] = nn.Linear(model.fc[0].in_features, NUM_CLASSES)
+    return model
 
 
 class CustomDataset(Dataset):
@@ -128,9 +85,8 @@ class CustomDataset(Dataset):
         return x, y
 
 def measure_accuracy(global_model, test_loader):
-    model = Network1().to(device)
+    model = build_model().to(device)
     model.load_state_dict(global_model)
-    model.half()
     model.eval()
 
     accuracy = 0.0
@@ -141,7 +97,7 @@ def measure_accuracy(global_model, test_loader):
     with torch.no_grad():
         print("\n")
         for inputs, labels in tqdm(test_loader, desc="Test"):
-            inputs = inputs.to(device).half()
+            inputs = inputs.to(device)
             labels = labels.to(device)
             outputs = model(inputs)
             correct += (outputs.argmax(1) == labels).sum().item()
@@ -153,6 +109,91 @@ def measure_accuracy(global_model, test_loader):
     inference_time = inference_end - inference_start
 
     return accuracy, model, inference_time
+
+def build_weighted_average(client_payloads):
+    total_samples = sum(max(1, int(item.get("num_samples", 1))) for item in client_payloads)
+    if total_samples <= 0:
+        return {}, {}
+
+    avg_grads = {}
+    avg_buffers = {}
+    for item in client_payloads:
+        weight = max(1, int(item.get("num_samples", 1))) / float(total_samples)
+
+        for name, grad in item["grads"].items():
+            grad_cpu = grad.detach().cpu()
+            if name not in avg_grads:
+                avg_grads[name] = grad_cpu * weight
+            else:
+                avg_grads[name] += grad_cpu * weight
+
+        for name, buf in item.get("buffers", {}).items():
+            buf_cpu = buf.detach().cpu().float()
+            if name not in avg_buffers:
+                avg_buffers[name] = buf_cpu * weight
+            else:
+                avg_buffers[name] += buf_cpu * weight
+
+    return avg_grads, avg_buffers
+
+
+def clone_attack_payload(attack):
+    if not isinstance(attack, dict):
+        return None
+
+    cloned = {
+        "global_index": int(attack.get("global_index", -1)),
+        "gt_label": int(attack.get("gt_label", -1)),
+        "num_classes": int(attack.get("num_classes", NUM_CLASSES)),
+        "input_shape": tuple(attack.get("input_shape", (1, 3, IMG_SIZE, IMG_SIZE))),
+        "norm_mean": list(attack.get("norm_mean", NORM_MEAN)),
+        "norm_std": list(attack.get("norm_std", NORM_STD)),
+    }
+
+    if "gradients" in attack:
+        cloned["gradients"] = [grad.detach().cpu().clone() for grad in attack["gradients"]]
+    if "model_state" in attack:
+        cloned["model_state"] = {
+            name: tensor.detach().cpu().clone()
+            for name, tensor in attack["model_state"].items()
+        }
+    if "gt_data" in attack:
+        cloned["gt_data"] = attack["gt_data"].detach().cpu().clone()
+
+    return cloned
+
+def save_round_gradients(round_idx, client_payloads, model):
+    if round_idx not in GRAD_SAVE_ROUNDS:
+        return
+
+    avg_grads, avg_buffers = build_weighted_average(client_payloads)
+    GRAD_RECORD_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = GRAD_RECORD_DIR / f"round_{int(round_idx):03d}.pt"
+
+    payload = {
+        "round": int(round_idx),
+        "num_classes": NUM_CLASSES,
+        "input_shape": (1, 3, IMG_SIZE, IMG_SIZE),
+        "norm_mean": list(NORM_MEAN),
+        "norm_std": list(NORM_STD),
+        "model_state": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+        "clients": [],
+        "avg_grads": {k: v.detach().cpu().clone() for k, v in avg_grads.items()},
+        "avg_buffers": {k: v.detach().cpu().clone() for k, v in avg_buffers.items()},
+    }
+    for item in client_payloads:
+        payload["clients"].append(
+            {
+                "client_id": int(item.get("client_id", -1)),
+                "num_samples": int(item.get("num_samples", 1)),
+                "grads": {k: v.detach().cpu().clone() for k, v in item["grads"].items()},
+                "buffers": {k: v.detach().cpu().clone() for k, v in item.get("buffers", {}).items()},
+                "attack": clone_attack_payload(item.get("attack")),
+            }
+        )
+
+    torch.save(payload, out_path)
+    print(f"Saved gradient record: {out_path.name}")
 ##############################################################################################################################
 
 
@@ -162,7 +203,7 @@ def measure_accuracy(global_model, test_loader):
 
 ####################################################### 수정 금지 ##############################################################
 cnt = []
-model_list = []  # 수신받은 model 저장할 리스트
+grad_list = []  # 수신받은 gradient 저장할 리스트
 semaphore = threading.Semaphore(0)
 
 global_model = None
@@ -176,7 +217,7 @@ elif torch.cuda.is_available():
 else:
     device = "cpu"
 def handle_client(conn, addr, model, test_loader):
-    global model_list, global_model, global_accuracy, global_model_size, current_round, cnt
+    global grad_list, global_model, global_accuracy, global_model_size, current_round, cnt
     print(f"Connected by {addr}")
 
     while True:
@@ -193,17 +234,31 @@ def handle_client(conn, addr, model, test_loader):
         while remaining_payload_size != 0:
             received_payload += conn.recv(remaining_payload_size)
             remaining_payload_size = data_size - len(received_payload)
-        model = pickle.loads(received_payload)
+        received = pickle.loads(received_payload)
+        if not isinstance(received, dict) or "grads" not in received:
+            raise ValueError("Expected FedSGD payload with 'grads'.")
 
-        model_list.append(model)
-        # print(models)
-        if len(model_list) == 2:
+        grad_list.append(
+            {
+                "client_id": int(received.get("client_id", -1)),
+                "num_samples": int(received.get("num_samples", 1)),
+                "grads": received["grads"],
+                "buffers": received.get("buffers", {}),
+                "attack": received.get("attack"),
+            }
+        )
+
+        if len(grad_list) == 2:
             current_round += 1
-            global_model = average_models(model_list)
-            global_accuracy, global_model, _ = measure_accuracy(global_model, test_loader)
+            save_round_gradients(current_round, grad_list, global_model)
+            apply_fedsgd_update(global_model, grad_list, server_lr)
+            global_accuracy, global_model, _ = measure_accuracy(
+                dict(global_model.state_dict().items()),
+                test_loader,
+            )
             print(f"Global round [{current_round} / {global_round}] Accuracy : {global_accuracy}%")
             global_model_size = get_model_size(global_model)
-            model_list = []
+            grad_list = []
             semaphore.release()
         else:
             semaphore.acquire()
@@ -218,6 +273,26 @@ def handle_client(conn, addr, model, test_loader):
             weight = pickle.dumps(dict(global_model.state_dict().items()))
             conn.send(struct.pack('>I', len(weight)))
             conn.send(weight)
+
+def apply_fedsgd_update(model, client_payloads, lr):
+    avg_grads, avg_buffers = build_weighted_average(client_payloads)
+    if not avg_grads and not avg_buffers:
+        return
+
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if name not in avg_grads:
+                continue
+            param.sub_(lr * avg_grads[name].to(param.device, dtype=param.dtype))
+
+        for name, buf in model.named_buffers():
+            if name not in avg_buffers:
+                continue
+            averaged = avg_buffers[name].to(buf.device)
+            if torch.is_floating_point(buf):
+                buf.copy_(averaged.to(buf.dtype))
+            else:
+                buf.copy_(averaged.round().to(buf.dtype))
 
 def get_model_size(global_model):
     model_size = len(pickle.dumps(dict(global_model.state_dict().items())))
@@ -235,17 +310,6 @@ def get_random_subset(dataset, num_samples):
 
     return subset
 
-def average_models(models):
-    weight_avg = copy.deepcopy(models[0])
-
-    for key in weight_avg.keys():
-        for i in range(1, len(models)):
-            weight_avg[key] += models[i][key]
-        weight_avg[key] = torch.div(weight_avg[key], len(models))
-
-    return weight_avg
-
-
 def main():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.bind((host, port))
@@ -254,13 +318,20 @@ def main():
     address = []
 
     ############################ 수정 가능 ############################
-    train_dataset = CustomDataset(DATASET_NAME, is_train=False, transform=test_transform)
+    train_dataset = datasets.CIFAR10(
+        root=DATASET_ROOT,
+        train=False,
+        download=True,
+        transform=test_transform,
+    )
 
     test_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=batch_size, shuffle=False, num_workers=0
     )
 
-    model = Network1().half().to(device)
+    global global_model
+    model = build_model().to(device)
+    global_model = model
     ####################################################################
 
     print(f"Server is listening on {host}:{port}")
