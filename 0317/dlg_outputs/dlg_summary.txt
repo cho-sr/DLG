@@ -1,0 +1,7 @@
+pt_file: gradient_records/round_001.pt
+gradient_source: client_2.attack.gradients
+pred_class: 1
+dummy_class: 9
+global_index: 1
+gt_label: 9
+final_grad_loss: 0.000002
