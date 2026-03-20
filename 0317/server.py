@@ -362,7 +362,7 @@ def main():
     global global_model,global_optimizer
     model = build_model().to(device)
     global_model = model
-    global_optimizer = torch.optim.SGD(global_model.parameters(), lr=server_lr, momentum=0.9)
+    global_optimizer = torch.optim.Adam(global_model.parameters(), lr=server_lr)
     ####################################################################
 
     print(f"Server is listening on {host}:{port}")
