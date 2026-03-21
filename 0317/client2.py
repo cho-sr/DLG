@@ -68,11 +68,18 @@ attack_transform = v2.Compose([
     v2.Normalize(mean=NORM_MEAN, std=NORM_STD),
 ])
 
-def build_model():
+def build_model(num_classes: int = NUM_CLASSES):
     model = LeNet()
-    if NUM_CLASSES != 10:
-        model.fc[0] = nn.Linear(model.fc[0].in_features, NUM_CLASSES)
+    if num_classes != 10:
+        model.fc[0] = nn.Linear(model.fc[0].in_features, num_classes)
     return model
+
+
+def infer_num_classes_from_state_dict(state_dict):
+    classifier_weight = state_dict.get("fc.0.weight")
+    if classifier_weight is None:
+        return NUM_CLASSES
+    return int(classifier_weight.shape[0])
 
 
 def train(model, criterion, optimizer, train_loader, device):
@@ -180,7 +187,7 @@ def compute_fedsgd_gradient(
 
     attack_payload = {
         "global_index": int(attack_global_index),
-        "num_classes": NUM_CLASSES,
+        "num_classes": int(model.fc[0].out_features),
         "input_shape": tuple(attack_x.shape),
         "norm_mean": list(NORM_MEAN),
         "norm_std": list(NORM_STD),
@@ -266,6 +273,14 @@ def main():
         dict_weight = pickle.loads(rec_payload)
         weight = OrderedDict(dict_weight)
         print("\nReceived updated global model from server")
+
+        server_num_classes = infer_num_classes_from_state_dict(weight)
+        if model.fc[0].out_features != server_num_classes:
+            print(
+                f"Adjusting local classifier size: "
+                f"{model.fc[0].out_features} -> {server_num_classes}"
+            )
+            model = build_model(server_num_classes).to(device)
 
         model.load_state_dict(weight, strict=True)
 

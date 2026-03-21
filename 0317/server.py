@@ -22,6 +22,7 @@ import torchvision.transforms.v2 as v2
 from models.vision import LeNet
 warnings.filterwarnings("ignore")
 
+# 재현 가능한 실험 결과를 위해 난수 시드를 고정한다.
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
@@ -51,6 +52,7 @@ NORM_MEAN = [0.4914, 0.4822, 0.4465]
 NORM_STD = [0.2023, 0.1994, 0.2010]
 
 
+# 서버가 글로벌 모델을 평가할 때 사용하는 공통 전처리 파이프라인이다.
 test_transform = v2.Compose([
     v2.ToImage(),
     v2.Resize((IMG_SIZE, IMG_SIZE)),
@@ -59,6 +61,7 @@ test_transform = v2.Compose([
                  std=NORM_STD),
 ])
 
+# 클래스 수 설정에 맞춰 마지막 분류기만 교체한 글로벌 모델을 만든다.
 def build_model():
     model = LeNet()
     if NUM_CLASSES != 10:
@@ -67,6 +70,7 @@ def build_model():
 
 
 class CustomDataset(Dataset):
+    # 저장된 PT 묶음을 torch Dataset 형태로 감싸 재사용한다.
     def __init__(self, pt_path: str, is_train: bool = False, transform=None):
         print(pt_path)
         blob = torch.load(pt_path, map_location="cpu", weights_only=False)
@@ -84,6 +88,7 @@ class CustomDataset(Dataset):
             x = self.transform(x)
         return x, y
 
+# 현재 글로벌 모델 정확도와 전체 추론 시간을 함께 측정한다.
 def measure_accuracy(global_model, test_loader):
     model = build_model().to(device)
     model.load_state_dict(global_model)
@@ -110,6 +115,7 @@ def measure_accuracy(global_model, test_loader):
 
     return accuracy, model, inference_time
 
+# 클라이언트별 샘플 수 비율로 gradient와 buffer를 가중 평균한다.
 def build_weighted_average(client_payloads):
     total_samples = sum(max(1, int(item.get("num_samples", 1))) for item in client_payloads)
     if total_samples <= 0:
@@ -140,6 +146,7 @@ def build_weighted_average(client_payloads):
 # [수정 1] server.py 내부 apply_fedsgd_update 함수 완전 교체
 # 이유: 수동 연산(param.sub_) 대신 옵티마이저의 step()을 활용하기 위함
 # =====================================================================
+# 평균 gradient를 optimizer에 주입해 서버 측 글로벌 모델을 한 번 업데이트한다.
 def apply_fedsgd_update(model, optimizer, client_payloads):
     avg_grads, avg_buffers = build_weighted_average(client_payloads)
     if not avg_grads and not avg_buffers:
@@ -166,6 +173,7 @@ def apply_fedsgd_update(model, optimizer, client_payloads):
     # 3. 옵티마이저 업데이트 실행 (Momentum 적용됨)
     optimizer.step()
 
+# DLG 재구성을 위해 필요한 공격용 부가 정보를 CPU 텐서로 안전하게 복제한다.
 def clone_attack_payload(attack):
     if not isinstance(attack, dict):
         return None
@@ -191,6 +199,7 @@ def clone_attack_payload(attack):
 
     return cloned
 
+# 지정된 라운드의 개별/평균 gradient를 파일로 저장해 이후 분석에 사용한다.
 def save_round_gradients(round_idx, client_payloads, model):
     if round_idx not in GRAD_SAVE_ROUNDS:
         return
@@ -231,6 +240,7 @@ def save_round_gradients(round_idx, client_payloads, model):
 
 
 ####################################################### 수정 금지 ##############################################################
+# 두 클라이언트 스레드가 함께 쓰는 공유 상태를 전역으로 둔다.
 cnt = []
 grad_list = []  # 수신받은 gradient 저장할 리스트
 semaphore = threading.Semaphore(0)
@@ -240,17 +250,22 @@ global_optimizer = None
 global_model_size = 0
 global_accuracy = 0.0
 current_round = 0
+
+# 사용 가능한 가속 장치를 우선순위에 따라 선택한다.
 if torch.backends.mps.is_available():
     device = "mps"
 elif torch.cuda.is_available():
     device = "cuda"
 else:
     device = "cpu"
+
+# 클라이언트 1개와의 연결을 전담하며, 수신/동기화/집계를 반복 수행한다.
 def handle_client(conn, addr, model, test_loader):
     global grad_list, global_model, global_accuracy, global_model_size, current_round, cnt, global_optimizer
     print(f"Connected by {addr}")
 
     while True:
+        # 최초 1회는 두 클라이언트 모두 같은 글로벌 모델 가중치를 받도록 전송한다.
         if len(cnt) < 2:
             cnt.append(1)
             weight = pickle.dumps(dict(model.state_dict().items()))
@@ -258,6 +273,7 @@ def handle_client(conn, addr, model, test_loader):
             conn.send(struct.pack('>I', len(weight)))
             conn.send(weight)
 
+        # 길이 정보를 먼저 읽고, 그 크기만큼 payload를 수신해 역직렬화한다.
         data_size = struct.unpack('>I', conn.recv(4))[0]
         received_payload = b""
         remaining_payload_size = data_size
@@ -278,6 +294,7 @@ def handle_client(conn, addr, model, test_loader):
             }
         )
 
+        # 두 클라이언트의 gradient가 모두 모이면 한 라운드 집계/평가를 수행한다.
         if len(grad_list) == 2:
             current_round += 1
             save_round_gradients(current_round, grad_list, global_model)
@@ -293,6 +310,7 @@ def handle_client(conn, addr, model, test_loader):
         else:
             semaphore.acquire()
 
+        # 종료 조건을 만족하면 마지막 글로벌 모델을 보내고 연결을 닫는다.
         if (current_round == global_round) or (global_accuracy >= target_accuracy):
             weight = pickle.dumps(dict(global_model.state_dict().items()))
             conn.send(struct.pack('>I', len(weight)))
@@ -324,6 +342,7 @@ def handle_client(conn, addr, model, test_loader):
 #             else:
 #                 buf.copy_(averaged.round().to(buf.dtype))
 
+# 직렬화된 state_dict 기준으로 모델 크기를 MB 단위로 계산한다.
 def get_model_size(global_model):
     model_size = len(pickle.dumps(dict(global_model.state_dict().items())))
     model_size = model_size / (1024 ** 2)
@@ -331,6 +350,7 @@ def get_model_size(global_model):
     return model_size
 
 
+# 필요 시 데이터셋 일부만 무작위로 뽑아 실험할 수 있게 돕는 유틸 함수다.
 def get_random_subset(dataset, num_samples):
     if num_samples > len(dataset):
         raise ValueError(f"num_samples should not exceed {len(dataset)} (total number of samples in test dataset).")
@@ -340,6 +360,7 @@ def get_random_subset(dataset, num_samples):
 
     return subset
 
+# 서버 소켓 생성부터 데이터셋 로드, 클라이언트 연결, 학습 종료 보고까지 담당한다.
 def main():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.bind((host, port))
@@ -348,6 +369,7 @@ def main():
     address = []
 
     ############################ 수정 가능 ############################
+    # 서버는 글로벌 모델 성능 확인용 테스트셋을 로드한다.
     train_dataset = datasets.CIFAR10(
         root=DATASET_ROOT,
         train=False,
@@ -367,6 +389,7 @@ def main():
 
     print(f"Server is listening on {host}:{port}")
 
+    # 현재 구현은 두 클라이언트가 모두 접속하면 학습을 시작한다.
     while len(address) < 2 and len(connection) < 2:
         conn, addr = server.accept()
         connection.append(conn)
@@ -374,6 +397,7 @@ def main():
 
     training_start = time.time()
 
+    # 각 클라이언트 연결을 별도 스레드에서 처리하되, 라운드 집계는 semaphore로 맞춘다.
     connection1 = threading.Thread(target=handle_client, args=(connection[0], address[0], model, test_loader))
     connection2 = threading.Thread(target=handle_client, args=(connection[1], address[1], model, test_loader))
 
