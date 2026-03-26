@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+data/
+outputs/
+test_outputs/
+test_outputs_no_download/
