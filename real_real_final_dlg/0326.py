@@ -449,3 +449,4 @@ if __name__ == "__main__":
     parsed_args = parser.parse_args()
     validate_args(parsed_args)
     run_fedsgd(parsed_args)
+
