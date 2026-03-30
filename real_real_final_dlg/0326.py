@@ -266,6 +266,16 @@ class FedSGDClient:
             "sample_index": sample_index,
             "label": int(label),
             "loss": float(loss.item()),
+            "sample_shape": tuple(image.shape),
+            "model_name": type(global_model).__name__,
+            "model_state_dict": {
+                name: parameter.detach().cpu().clone()
+                for name, parameter in global_model.state_dict().items()
+            },
+            "normalization": {
+                "mean": (0.4914, 0.4822, 0.4465),
+                "std": (0.2023, 0.1994, 0.2010),
+            },
             "named_grads": grads,
         }
 
@@ -360,6 +370,7 @@ def run_fedsgd(args: argparse.Namespace) -> None:
                 server.model,
                 args.dlg_sample_index,
             )
+            dlg_gradient["round"] = round_idx
             if args.save_dlg:
                 save_path = Path(args.save_dir) / (
                     f"dlg_round_{round_idx:03d}_client_{args.dlg_client_id}_"
