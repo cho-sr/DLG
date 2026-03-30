@@ -11,6 +11,8 @@ from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
 
+# 전체 실험에서 재현 가능성을 높이기 위해 Python/PyTorch 난수를 고정한다.
+# CUDA를 사용할 경우 GPU 난수 시드도 함께 설정한다.
 def set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
@@ -19,6 +21,8 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+# 사용 가능한 연산 장치를 선택한다.
+# Apple Silicon(MPS) -> CUDA -> CPU 순으로 우선 사용한다.
 def get_device() -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
@@ -27,7 +31,11 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
+# CIFAR-10 분류를 위한 간단한 CNN 모델이다.
+# 합성곱 블록으로 특징을 추출한 뒤, 선형 계층으로 10개 클래스를 분류한다.
 class SimpleCifarCNN(nn.Module):
+    # 특징 추출기와 분류기를 초기화한다.
+    # 32x32 입력이 세 번의 pooling 이후 4x4가 된다는 점을 전제로 한다.
     def __init__(self) -> None:
         super().__init__()
         self.features = nn.Sequential(
@@ -48,10 +56,13 @@ class SimpleCifarCNN(nn.Module):
             nn.Linear(256, 10),
         )
 
+    # 입력 이미지를 특징 추출기와 분류기에 통과시켜 클래스 로짓을 반환한다.
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.classifier(self.features(x))
 
 
+# CIFAR-10용 학습/평가 전처리를 구성한다.
+# 현재는 ToTensor와 정규화만 적용하며, 데이터 증강은 사용하지 않는다.
 def build_transforms() -> Tuple[transforms.Compose, transforms.Compose]:
     mean = (0.4914, 0.4822, 0.4465)
     std = (0.2023, 0.1994, 0.2010)
@@ -70,6 +81,7 @@ def build_transforms() -> Tuple[transforms.Compose, transforms.Compose]:
     return train_transform, test_transform
 
 
+# 전체 학습 데이터를 무작위로 섞은 뒤 client들에게 균등하게 나누는 IID 분할 함수다.
 def partition_dataset_iid(dataset: datasets.CIFAR10, num_clients: int, seed: int) -> List[List[int]]:
     generator = torch.Generator().manual_seed(seed)
     shuffled_indices = torch.randperm(len(dataset), generator=generator).tolist()
@@ -81,6 +93,8 @@ def partition_dataset_iid(dataset: datasets.CIFAR10, num_clients: int, seed: int
     return client_splits
 
 
+# 각 client가 제한된 수의 클래스를 중심으로 데이터를 갖도록 non-IID 분할을 수행한다.
+# 남은 샘플은 마지막에 다시 전체 client에 분배하므로 완전히 분리된 클래스 구조는 아닐 수 있다.
 def partition_dataset_noniid(
     dataset: datasets.CIFAR10,
     num_clients: int,
@@ -117,6 +131,7 @@ def partition_dataset_noniid(
     return client_splits
 
 
+# CIFAR-10 학습/테스트 데이터를 내려받고 지정한 transform을 적용해 반환한다.
 def build_datasets(data_dir: Path) -> Tuple[datasets.CIFAR10, datasets.CIFAR10]:
     train_transform, test_transform = build_transforms()
     train_dataset = datasets.CIFAR10(
@@ -134,6 +149,8 @@ def build_datasets(data_dir: Path) -> Tuple[datasets.CIFAR10, datasets.CIFAR10]:
     return train_dataset, test_dataset
 
 
+# client별 인덱스 목록을 받아 각 client 전용 DataLoader를 생성한다.
+# 실제 데이터는 Subset으로 원본 train_dataset을 참조한다.
 def build_client_loaders(
     train_dataset: datasets.CIFAR10,
     client_indices: List[List[int]],
@@ -154,6 +171,8 @@ def build_client_loaders(
     return client_loaders
 
 
+# 전체 테스트셋 평가용 DataLoader를 생성한다.
+# 평가 단계이므로 shuffle은 사용하지 않는다.
 def build_test_loader(test_dataset: datasets.CIFAR10, batch_size: int) -> DataLoader:
     return DataLoader(
         test_dataset,
@@ -164,6 +183,8 @@ def build_test_loader(test_dataset: datasets.CIFAR10, batch_size: int) -> DataLo
     )
 
 
+# 한 client가 한 번의 배치 계산으로 만든 결과를 저장하는 구조체다.
+# gradient, loss, 정답 수, 배치 크기를 함께 보관한다.
 @dataclass
 class ClientBatchResult:
     grads: Dict[str, torch.Tensor]
@@ -173,12 +194,15 @@ class ClientBatchResult:
 
 
 class FedSGDClient:
+    # 각 client의 식별자, 로컬 DataLoader, 연산 장치를 저장하고 배치 iterator를 준비한다.
     def __init__(self, client_id: int, loader: DataLoader, device: torch.device) -> None:
         self.client_id = client_id
         self.loader = loader
         self.device = device
         self.iterator: Iterator = iter(loader)
 
+    # 로컬 DataLoader에서 다음 배치를 가져온다.
+    # iterator가 끝났다면 다시 처음부터 순환하도록 재생성한다.
     def _next_batch(self) -> Tuple[torch.Tensor, torch.Tensor]:
         try:
             images, labels = next(self.iterator)
@@ -187,6 +211,8 @@ class FedSGDClient:
             images, labels = next(self.iterator)
         return images.to(self.device), labels.to(self.device)
 
+    # 현재 글로벌 모델을 복사한 뒤, 로컬 미니배치 하나에 대한 gradient를 계산한다.
+    # FedSGD에서 서버로 전송할 배치 기반 gradient와 통계값을 함께 만든다.
     def compute_batch_gradient(self, global_model: nn.Module) -> ClientBatchResult:
         local_model = copy.deepcopy(global_model).to(self.device)
         local_model.train()
@@ -210,6 +236,8 @@ class FedSGDClient:
         )
 
     # MODIFIED: add DLG-specific single-sample gradient extraction from a fixed local sample.
+    # 로컬 데이터 중 특정 샘플 하나만 사용해 gradient를 계산한다.
+    # DLG 같은 gradient inversion 실험에서 사용할 수 있도록 CPU 텐서 형태로 반환한다.
     def compute_single_sample_gradient(self, global_model: nn.Module, sample_index: int) -> Dict[str, object]:
         if sample_index < 0 or sample_index >= len(self.loader.dataset):
             raise IndexError(
@@ -243,11 +271,13 @@ class FedSGDClient:
 
 
 class FedSGDServer:
+    # 글로벌 모델과 이를 갱신할 SGD optimizer를 초기화한다.
     def __init__(self, model: nn.Module, lr: float, device: torch.device) -> None:
         self.model = model.to(device)
         self.optimizer = torch.optim.SGD(self.model.parameters(), lr=lr, momentum=0.0)
         self.device = device
 
+    # 여러 client가 보낸 gradient를 배치 크기 비율로 가중 평균해 글로벌 모델을 업데이트한다.
     def aggregate(self, client_results: List[ClientBatchResult]) -> None:
         total_weight = sum(result.batch_size for result in client_results)
         aggregated_grads: Dict[str, torch.Tensor] = {}
@@ -266,6 +296,8 @@ class FedSGDServer:
         self.optimizer.step()
 
     @torch.no_grad()
+    # 현재 글로벌 모델을 주어진 DataLoader에서 평가한다.
+    # 평균 loss와 accuracy를 반환하며, 로컬 데이터와 테스트셋 평가에 공통으로 사용된다.
     def evaluate(self, data_loader: DataLoader) -> Tuple[float, float]:
         # MODIFIED: this evaluator is now used for both client-local datasets and the global test set.
         self.model.eval()
@@ -287,6 +319,8 @@ class FedSGDServer:
         return total_loss / total_samples, total_correct / total_samples
 
 
+# 전체 FedSGD 실험을 실행하는 메인 루프다.
+# 데이터 준비, 분할, client/server 생성, 라운드별 학습, DLG gradient 추출, 성능 평가를 담당한다.
 def run_fedsgd(args: argparse.Namespace) -> None:
     set_seed(args.seed)
     device = get_device()
@@ -365,6 +399,8 @@ def run_fedsgd(args: argparse.Namespace) -> None:
         )
 
 
+# 실행에 사용할 CLI 인자를 정의한다.
+# 학습 설정과 DLG gradient 추출 관련 옵션을 함께 등록한다.
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="FedSGD on CIFAR-10")
     parser.add_argument("--data-dir", type=str, default="./data", help="Path to store CIFAR-10")
@@ -427,6 +463,8 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# 전달된 실행 인자가 유효한지 검사한다.
+# client 수, round 수, DLG 관련 인덱스와 라운드 범위를 확인한다.
 def validate_args(args: argparse.Namespace) -> None:
     if args.clients_per_round > args.num_clients:
         raise ValueError("clients_per_round must be less than or equal to num_clients.")
@@ -449,4 +487,3 @@ if __name__ == "__main__":
     parsed_args = parser.parse_args()
     validate_args(parsed_args)
     run_fedsgd(parsed_args)
-
