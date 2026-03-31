@@ -11,24 +11,23 @@ def weights_init(m):
         m.weight.data.uniform_(-0.5, 0.5)
     if hasattr(m, "bias"):
         m.bias.data.uniform_(-0.5, 0.5)
-
-
+        
 class LeNet(nn.Module):
     def __init__(self):
         super(LeNet, self).__init__()
         act = nn.Sigmoid
         self.body = nn.Sequential(
-            nn.Conv2d(3, 12, kernel_size=5, padding=5 // 2, stride=2),
+            nn.Conv2d(3, 12, kernel_size=5, padding=5//2, stride=2),
             act(),
-            nn.Conv2d(12, 12, kernel_size=5, padding=5 // 2, stride=2),
+            nn.Conv2d(12, 12, kernel_size=5, padding=5//2, stride=2),
             act(),
-            nn.Conv2d(12, 12, kernel_size=5, padding=5 // 2, stride=1),
+            nn.Conv2d(12, 12, kernel_size=5, padding=5//2, stride=1),
             act(),
         )
         self.fc = nn.Sequential(
-            nn.Linear(768, 100)
+            nn.Linear(768, 10)
         )
-
+        
     def forward(self, x):
         out = self.body(x)
         out = out.view(out.size(0), -1)
@@ -51,16 +50,10 @@ import torch.nn.functional as F
 
 
 def weights_init(m):
-    # Conv / Linear만 초기화 (원래 코드가 뭐였든, 안전장치 추가)
-    if isinstance(m, (nn.Conv2d, nn.Linear)):
-        # weight 초기화 (원래 하던 방식 유지/원하면 바꾸기)
-        if m.weight is not None:
-            m.weight.data.uniform_(-0.5, 0.5)
-
-        # ✅ bias가 있을 때만 초기화
-        if m.bias is not None:
-            m.bias.data.uniform_(-0.5, 0.5)
-
+    if hasattr(m, "weight"):
+        m.weight.data.uniform_(-0.5, 0.5)
+    if hasattr(m, "bias"):
+        m.bias.data.uniform_(-0.5, 0.5)
 
 class BasicBlock(nn.Module):
     expansion = 1
@@ -73,17 +66,17 @@ class BasicBlock(nn.Module):
         self.bn2 = nn.BatchNorm2d(planes)
 
         self.shortcut = nn.Sequential()
-        if stride != 1 or in_planes != self.expansion * planes:
+        if stride != 1 or in_planes != self.expansion*planes:
             self.shortcut = nn.Sequential(
-                nn.Conv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(self.expansion * planes)
+                nn.Conv2d(in_planes, self.expansion*planes, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(self.expansion*planes)
             )
 
     def forward(self, x):
-        out = F.sigmoid(self.bn1(self.conv1(x)))
+        out = F.Sigmoid(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
         out += self.shortcut(x)
-        out = F.sigmoid(out)
+        out = F.Sigmoid(out)
         return out
 
 
@@ -96,22 +89,22 @@ class Bottleneck(nn.Module):
         self.bn1 = nn.BatchNorm2d(planes)
         self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(planes)
-        self.conv3 = nn.Conv2d(planes, self.expansion * planes, kernel_size=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(self.expansion * planes)
+        self.conv3 = nn.Conv2d(planes, self.expansion*planes, kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(self.expansion*planes)
 
         self.shortcut = nn.Sequential()
-        if stride != 1 or in_planes != self.expansion * planes:
+        if stride != 1 or in_planes != self.expansion*planes:
             self.shortcut = nn.Sequential(
-                nn.Conv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(self.expansion * planes)
+                nn.Conv2d(in_planes, self.expansion*planes, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(self.expansion*planes)
             )
 
     def forward(self, x):
-        out = F.sigmoid(self.bn1(self.conv1(x)))
-        out = F.sigmoid(self.bn2(self.conv2(out)))
+        out = F.Sigmoid(self.bn1(self.conv1(x)))
+        out = F.Sigmoid(self.bn2(self.conv2(out)))
         out = self.bn3(self.conv3(out))
         out += self.shortcut(x)
-        out = F.sigmoid(out)
+        out = F.Sigmoid(out)
         return out
 
 
@@ -126,10 +119,10 @@ class ResNet(nn.Module):
         self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=1)
         self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=1)
         self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=1)
-        self.linear = nn.Linear(512 * block.expansion, num_classes)
+        self.linear = nn.Linear(512*block.expansion, num_classes)
 
     def _make_layer(self, block, planes, num_blocks, stride):
-        strides = [stride] + [1] * (num_blocks - 1)
+        strides = [stride] + [1]*(num_blocks-1)
         layers = []
         for stride in strides:
             layers.append(block(self.in_planes, planes, stride))
@@ -137,32 +130,28 @@ class ResNet(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        out = F.sigmoid(self.bn1(self.conv1(x)))
+        out = F.Sigmoid(self.bn1(self.conv1(x)))
         out = self.layer1(out)
         out = self.layer2(out)
         out = self.layer3(out)
         out = self.layer4(out)
-        out = F.adaptive_avg_pool2d(out, (1, 1))
+        out = F.avg_pool2d(out, 4)
         out = out.view(out.size(0), -1)
         out = self.linear(out)
         return out
 
 
 def ResNet18():
-    return ResNet(BasicBlock, [2, 2, 2, 2])
-
+    return ResNet(BasicBlock, [2,2,2,2])
 
 def ResNet34():
-    return ResNet(BasicBlock, [3, 4, 6, 3])
-
+    return ResNet(BasicBlock, [3,4,6,3])
 
 def ResNet50():
-    return ResNet(Bottleneck, [3, 4, 6, 3])
-
+    return ResNet(Bottleneck, [3,4,6,3])
 
 def ResNet101():
-    return ResNet(Bottleneck, [3, 4, 23, 3])
-
+    return ResNet(Bottleneck, [3,4,23,3])
 
 def ResNet152():
-    return ResNet(Bottleneck, [3, 8, 36, 3])
+    return ResNet(Bottleneck, [3,8,36,3])
