@@ -13,8 +13,8 @@ from utils import label_to_onehot, cross_entropy_for_onehot
 from models.vision import LeNet, weights_init
 
 
-FRONT_RATIO = 0.1
-BACK_RATIO = 0.9
+FRONT_RATIO = 0.91
+BACK_RATIO = 0.99
 LAYER_ORDER = ["body.0", "body.2", "body.4", "fc.0"]
 FRONT_LAYERS = {"body.0", "body.2"}
 BACK_LAYERS = {"body.4", "fc.0"}
@@ -159,7 +159,7 @@ def main():
     optimizer = torch.optim.LBFGS([dummy_data, dummy_label])
 
     history = []
-    for iters in range(300):
+    for iters in range(400):
         def closure():
             optimizer.zero_grad()
 
@@ -182,8 +182,8 @@ def main():
             history.append(tt(dummy_data[0].cpu()))
 
     plt.figure(figsize=(12, 8))
-    for i in range(30):
-        plt.subplot(3, 10, i + 1)
+    for i in range(40):
+        plt.subplot(4, 10, i + 1)
         plt.imshow(history[i])
         plt.title("iter=%d" % (i * 10))
         plt.axis("off")
