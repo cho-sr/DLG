@@ -1,0 +1,28 @@
+device: mps
+front_ratio: 0.91
+back_ratio: 0.99
+initial_test_loss: 6.347800
+initial_test_accuracy: 10.01
+round_0: train_loss=6.346408, train_acc=10.00, test_loss=5.511927, test_acc=10.28, agg_grad_l2=12.344346, upload_retention=0.966953
+round_1: train_loss=5.510544, train_acc=10.24, test_loss=6.127810, test_acc=10.06, agg_grad_l2=8.067287, upload_retention=0.966953
+round_2: train_loss=6.128417, train_acc=10.06, test_loss=7.974958, test_acc=10.00, agg_grad_l2=10.291659, upload_retention=0.966953
+round_3: train_loss=7.978708, train_acc=10.00, test_loss=8.099038, test_acc=10.00, agg_grad_l2=20.102192, upload_retention=0.966953
+round_4: train_loss=8.100947, train_acc=10.00, test_loss=7.028724, test_acc=10.00, agg_grad_l2=9.249484, upload_retention=0.966953
+final_test_loss: 7.028724
+final_test_accuracy: 10.00
+macro_precision: 0.010001
+macro_recall: 0.100000
+macro_f1: 0.018183
+weighted_precision: 0.010001
+weighted_recall: 0.100000
+weighted_f1: 0.018183
+class_accuracy[airplane]: 0.000000
+class_accuracy[automobile]: 1.000000
+class_accuracy[bird]: 0.000000
+class_accuracy[cat]: 0.000000
+class_accuracy[deer]: 0.000000
+class_accuracy[dog]: 0.000000
+class_accuracy[frog]: 0.000000
+class_accuracy[horse]: 0.000000
+class_accuracy[ship]: 0.000000
+class_accuracy[truck]: 0.000000
