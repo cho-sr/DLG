@@ -15,9 +15,6 @@ from models.vision import LeNet, weights_init
 from utils import cross_entropy_for_onehot, label_to_onehot
 
 
-DEFAULT_SAVE_ROUNDS = [10, 20, 30, 40, 50]
-
-
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -205,8 +202,8 @@ def train_client_fedavg(
 
 def parse_args():
     parser = argparse.ArgumentParser("FedAvg training with per-round DLG gradient capture")
-    parser.add_argument("--num_clients", type=int, default=5)
-    parser.add_argument("--rounds", type=int, default=50)
+    parser.add_argument("--num_clients", type=int, default=2)
+    parser.add_argument("--rounds", type=int, default=10)
     parser.add_argument("--frac", type=float, default=1.0)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--local_epochs", type=int, default=1)
@@ -217,15 +214,18 @@ def parse_args():
         "--save_rounds",
         nargs="+",
         type=int,
-        default=DEFAULT_SAVE_ROUNDS,
-        help="1-based round numbers whose first local-step gradients should be saved.",
+        default=None,
+        help="1-based round numbers whose first local-step gradients should be saved. Defaults to every round.",
     )
     parser.add_argument(
         "--out_dir",
         type=str,
         default=str(Path(__file__).resolve().parent / "fedavg_iter_outputs"),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.save_rounds is None:
+        args.save_rounds = list(range(1, args.rounds + 1))
+    return args
 
 
 def validate_args(args) -> None:
@@ -247,6 +247,8 @@ def validate_args(args) -> None:
         raise ValueError("--save_rounds must contain at least one round.")
     if any(round_idx < 1 for round_idx in args.save_rounds):
         raise ValueError("--save_rounds must contain only positive 1-based round indices.")
+    if any(round_idx > args.rounds for round_idx in args.save_rounds):
+        raise ValueError("--save_rounds must not exceed --rounds.")
 
 
 def main():
@@ -339,6 +341,8 @@ def main():
         if not client_state_dicts:
             raise RuntimeError("No client updates were produced in this round.")
 
+        # FedAvg mixes client updates here by averaging post-training model weights.
+        # The saved snapshot gradients above remain each client's raw first local-step gradients.
         averaged_state_dict = average_state_dicts(client_state_dicts, client_sizes)
         global_model.load_state_dict(averaged_state_dict, strict=True)
         test_metrics = evaluate_model(global_model, test_loader, device, num_classes)

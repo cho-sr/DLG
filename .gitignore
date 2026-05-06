@@ -7,10 +7,19 @@ sparsification/dataset/
 # Generated outputs
 sparsification/dlg_records/
 sparsification/dlg_outputs/
+DLG/SGD/fedavg_iter_attack_outputs/
+DLG/SGD/fedavg_iter_outputs/
+DLG/SGD/fedsgd_eval_outputs/
+DLG/SGD/layerwise_compare_outputs/
+real_real_final_dlg/dlg_outputs/
 
 # Python cache
 **/__pycache__/
 *.pyc
+
+# Local tooling
+.matplotlib/
+.vscode/
 
 # macOS metadata
 .DS_Store

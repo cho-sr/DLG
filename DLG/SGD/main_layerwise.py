@@ -2,12 +2,32 @@
 import argparse
 
 from PIL import Image
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt
+except Exception as exc:
+    plt = None
+    MATPLOTLIB_IMPORT_ERROR = exc
+else:
+    MATPLOTLIB_IMPORT_ERROR = None
 
-import torch
-import torch.nn.functional as F
-import torchvision
-from torchvision import datasets, transforms
+try:
+    import torch
+    import torch.nn.functional as F
+    import torchvision
+    from torchvision import datasets, transforms
+except ModuleNotFoundError as exc:
+    if exc.name == "typing_extensions":
+        raise SystemExit(
+            "Missing dependency: typing_extensions.\n"
+            "Run: conda run -n DLG python -m pip install typing_extensions"
+        ) from exc
+    if exc.name == "torchvision":
+        raise SystemExit(
+            "Missing dependency: torchvision.\n"
+            "Run: conda install -n DLG torchvision -c pytorch -y"
+        ) from exc
+        
+    raise
 
 from utils import label_to_onehot, cross_entropy_for_onehot
 from models.vision import LeNet, weights_init
@@ -18,6 +38,14 @@ BACK_RATIO = 0.99
 LAYER_ORDER = ["body.0", "body.2", "body.4", "fc.0"]
 FRONT_LAYERS = {"body.0", "body.2"}
 BACK_LAYERS = {"body.4", "fc.0"}
+
+
+def tensor_to_display_image(tensor, to_pil):
+    # Keep visualization robust when optimization produces NaN/Inf or values outside image range.
+    safe_tensor = tensor.detach().cpu().float()
+    safe_tensor = torch.nan_to_num(safe_tensor, nan=0.0, posinf=1.0, neginf=0.0)
+    safe_tensor = safe_tensor.clamp(0.0, 1.0)
+    return to_pil(safe_tensor)
 
 
 def layer_name_from_param_name(param_name):
@@ -122,7 +150,8 @@ def main():
     gt_label = gt_label.view(1,)
     gt_onehot_label = label_to_onehot(gt_label, num_classes=10)
 
-    plt.imshow(tt(gt_data[0].cpu()))
+    if plt is not None:
+        plt.imshow(tensor_to_display_image(gt_data[0], tt))
 
     net = LeNet().to(device)
     param_names = [name for name, _ in net.named_parameters()]
@@ -154,7 +183,8 @@ def main():
     dummy_data = torch.randn(gt_data.size()).to(device).requires_grad_(True)
     dummy_label = torch.randn(gt_onehot_label.size()).to(device).requires_grad_(True)
 
-    plt.imshow(tt(dummy_data[0].cpu()))
+    if plt is not None:
+        plt.imshow(tensor_to_display_image(dummy_data[0], tt))
 
     optimizer = torch.optim.LBFGS([dummy_data, dummy_label])
 
@@ -179,7 +209,13 @@ def main():
         if iters % 10 == 0:
             current_loss = closure()
             print(iters, "%.4f" % current_loss.item())
-            history.append(tt(dummy_data[0].cpu()))
+            history.append(tensor_to_display_image(dummy_data[0], tt))
+
+    if plt is None:
+        print("matplotlib is unavailable; skipping visualization.")
+        if MATPLOTLIB_IMPORT_ERROR is not None:
+            print(f"matplotlib import error: {MATPLOTLIB_IMPORT_ERROR}")
+        return
 
     plt.figure(figsize=(12, 8))
     for i in range(40):
