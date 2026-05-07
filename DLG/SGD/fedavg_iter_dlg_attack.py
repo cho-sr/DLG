@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import argparse
+import json
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -16,6 +17,7 @@ from utils import label_to_onehot, cross_entropy_for_onehot
 
 
 DEFAULT_PT_FILE = Path(__file__).resolve().parent / "fedavg_iter_outputs" / "fedavg_iter_gradients.pt"
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "fedavg_iter_attack_outputs"
 
 
 parser = argparse.ArgumentParser(description='Deep Leakage from Gradients from a FedAvg .pt snapshot.')
@@ -87,11 +89,14 @@ if int(gt_label.item()) != artifact_label:
         f"Snapshot label mismatch: artifact label={artifact_label}, dataset label={int(gt_label.item())}"
     )
 
+output_dir = DEFAULT_OUTPUT_DIR / f"round_{args.round}" / f"client_{args.client_id}"
+output_dir.mkdir(parents=True, exist_ok=True)
+
 gt_data = gt_data.view(1, *gt_data.size())
 gt_label = gt_label.view(1, )
 gt_onehot_label = label_to_onehot(gt_label, num_classes=10)
 
-plt.imshow(tt(gt_data[0].cpu()))
+tt(gt_data[0].detach().cpu()).save(output_dir / "gt.png")
 
 from models.vision import LeNet
 net = LeNet().to(device)
@@ -125,13 +130,15 @@ if missing_names:
 dummy_data = torch.randn(gt_data.size()).to(device).requires_grad_(True)
 dummy_label = torch.randn(gt_onehot_label.size()).to(device).requires_grad_(True)
 
-plt.imshow(tt(dummy_data[0].cpu()))
+tt(dummy_data[0].detach().cpu()).save(output_dir / "dummy_init.png")
 
 optimizer = torch.optim.LBFGS([dummy_data, dummy_label])
 
 
 history = []
-for iters in range(300):
+loss_history = []
+num_iters = 400
+for iters in range(num_iters):
     def closure():
         optimizer.zero_grad()
 
@@ -148,16 +155,61 @@ for iters in range(300):
         return grad_diff
 
     optimizer.step(closure)
+    # print(dummy_onehot_label.detach().cpu())
     if iters % 10 == 0:
         current_loss = closure()
         print(iters, "%.4f" % current_loss.item())
-        history.append(tt(dummy_data[0].cpu()))
+        loss_history.append({"iter": int(iters), "grad_loss": float(current_loss.item())})
+        history.append(tt(dummy_data[0].detach().cpu()))
+
+tt(dummy_data[0].detach().cpu()).save(output_dir / "dlg_recon.png")
+
+with open(output_dir / "loss_history.json", "w", encoding="utf-8") as fh:
+    json.dump(
+        {
+            "pt_file": str(pt_path),
+            "round": int(args.round),
+            "client_id": int(args.client_id),
+            "sample_index": img_index,
+            "label": artifact_label,
+            "loss_history": loss_history,
+        },
+        fh,
+        indent=2,
+    )
+
+with open(output_dir / "loss_history.txt", "w", encoding="utf-8") as fh:
+    fh.write("iter\tgrad_loss\n")
+    for row in loss_history:
+        fh.write(f"{row['iter']}\t{row['grad_loss']:.6f}\n")
+
+with torch.no_grad():
+    pred_class = int(net(gt_data).argmax(dim=1).item())
+    dummy_class = int(F.softmax(dummy_label, dim=-1).argmax(dim=1).item())
+
+with open(output_dir / "dlg_summary.txt", "w", encoding="utf-8") as fh:
+    fh.write(f"pt_file: {pt_path}\n")
+    fh.write(f"round: {args.round}\n")
+    fh.write(f"client_id: {args.client_id}\n")
+    fh.write(f"sample_index: {img_index}\n")
+    fh.write(f"artifact_label: {artifact_label}\n")
+    fh.write(f"pred_class: {pred_class}\n")
+    fh.write(f"dummy_class: {dummy_class}\n")
+    fh.write(f"input_shape: {input_shape}\n")
+    fh.write(f"iters: {num_iters}\n")
+    fh.write(f"gt_label: {int(gt_label.item())}\n")
+    if loss_history:
+        fh.write(f"final_grad_loss: {loss_history[-1]['grad_loss']:.6f}\n")
+    fh.write(f"loss_history_json: {output_dir / 'loss_history.json'}\n")
+    fh.write(f"loss_history_txt: {output_dir / 'loss_history.txt'}\n")
 
 plt.figure(figsize=(12, 8))
-for i in range(30):
-    plt.subplot(3, 10, i + 1)
+for i in range(len(history)):
+    plt.subplot(4, 10, i + 1)
     plt.imshow(history[i])
     plt.title("iter=%d" % (i * 10))
     plt.axis('off')
 
-plt.show()
+plt.savefig(output_dir / "dlg_progress_grid.png", bbox_inches="tight")
+plt.close()
+print(f"Saved DLG outputs to {output_dir}")
