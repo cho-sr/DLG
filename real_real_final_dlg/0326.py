@@ -1,6 +1,7 @@
 import argparse
 import copy
 import random
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterator, List, Tuple
@@ -9,6 +10,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
+
+CURRENT_DIR = Path(__file__).resolve().parent
+if str(CURRENT_DIR) not in sys.path:
+    sys.path.insert(0, str(CURRENT_DIR))
+
+from models.vision import LeNet
 
 
 # 전체 실험에서 재현 가능성을 높이기 위해 Python/PyTorch 난수를 고정한다.
@@ -29,36 +36,6 @@ def get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
-
-
-# CIFAR-10 분류를 위한 간단한 CNN 모델이다.
-# 합성곱 블록으로 특징을 추출한 뒤, 선형 계층으로 10개 클래스를 분류한다.
-class SimpleCifarCNN(nn.Module):
-    # 특징 추출기와 분류기를 초기화한다.
-    # 32x32 입력이 세 번의 pooling 이후 4x4가 된다는 점을 전제로 한다.
-    def __init__(self) -> None:
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2),
-        )
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(128 * 4 * 4, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, 10),
-        )
-
-    # 입력 이미지를 특징 추출기와 분류기에 통과시켜 클래스 로짓을 반환한다.
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.classifier(self.features(x))
 
 
 # CIFAR-10용 학습/평가 전처리를 구성한다.
@@ -353,7 +330,7 @@ def run_fedsgd(args: argparse.Namespace) -> None:
     test_loader = build_test_loader(test_dataset, args.test_batch_size)
 
     clients = [FedSGDClient(client_id=i, loader=loader, device=device) for i, loader in enumerate(client_loaders)]
-    server = FedSGDServer(SimpleCifarCNN(), lr=args.lr, device=device)
+    server = FedSGDServer(LeNet(), lr=args.lr, device=device)
     # MODIFIED: prepare DLG settings once so extraction only happens on selected rounds.
     dlg_rounds = set(args.dlg_rounds)
     dlg_client = clients[args.dlg_client_id]

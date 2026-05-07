@@ -122,6 +122,87 @@ def sparsify_gradients_topk(gradients, sparsity_ratio):
     return sparse_grads, stats
 
 
+def _layer_name_from_param_name(param_name):
+    parts = param_name.split(".")
+    if len(parts) < 2:
+        raise ValueError(f"Unsupported parameter name for layer-wise top-k: {param_name}")
+
+    layer_name = ".".join(parts[:2])
+    if layer_name not in {"body.0", "body.2", "body.4", "fc.0"}:
+        raise ValueError(f"Unexpected LeNet layer for layer-wise top-k: {param_name}")
+    return layer_name
+
+
+def _ratio_for_layer(layer_name, front_ratio, back_ratio):
+    if layer_name in {"body.0", "body.2"}:
+        return front_ratio
+    if layer_name in {"body.4", "fc.0"}:
+        return back_ratio
+    raise ValueError(f"Unknown layer name for layer-wise top-k: {layer_name}")
+
+
+def sparsify_gradients_layerwise_topk(gradients, param_names, front_ratio, back_ratio):
+    if len(gradients) != len(param_names):
+        raise ValueError("gradients and param_names must have the same length.")
+    if front_ratio <= 0.0 or front_ratio > 1.0:
+        raise ValueError("front_ratio must be in (0.0, 1.0].")
+    if back_ratio <= 0.0 or back_ratio > 1.0:
+        raise ValueError("back_ratio must be in (0.0, 1.0].")
+
+    layer_order = ["body.0", "body.2", "body.4", "fc.0"]
+    grouped = {layer: [] for layer in layer_order}
+
+    for idx, (name, grad_tensor) in enumerate(zip(param_names, gradients)):
+        layer_name = _layer_name_from_param_name(name)
+        grouped[layer_name].append((idx, grad_tensor))
+
+    sparse_grads = [None] * len(gradients)
+    layer_stats = []
+    total_kept = 0
+    total_params = 0
+
+    for layer_name in layer_order:
+        entries = grouped[layer_name]
+        flat = torch.cat([grad_tensor.reshape(-1) for _, grad_tensor in entries])
+        total = flat.numel()
+        ratio = _ratio_for_layer(layer_name, front_ratio, back_ratio)
+        kept = total if ratio >= 1.0 else max(1, int(total * ratio))
+
+        if kept >= total:
+            sparse_flat = flat.clone()
+        else:
+            _, topk_idx = torch.topk(flat.abs(), kept, largest=True, sorted=False)
+            mask = torch.zeros_like(flat)
+            mask[topk_idx] = 1.0
+            sparse_flat = flat * mask
+
+        offset = 0
+        for idx, grad_tensor in entries:
+            n = grad_tensor.numel()
+            sparse_grads[idx] = sparse_flat[offset : offset + n].view_as(grad_tensor)
+            offset += n
+
+        total_kept += kept
+        total_params += total
+        layer_stats.append(
+            {
+                "layer": layer_name,
+                "kept": kept,
+                "total": total,
+                "retention_ratio": kept / float(total),
+                "configured_ratio": ratio,
+            }
+        )
+
+    stats = {
+        "kept": total_kept,
+        "total": total_params,
+        "retention_ratio": total_kept / float(total_params),
+        "layer_stats": layer_stats,
+    }
+    return sparse_grads, stats
+
+
 def compute_mse_psnr(gt_tensor, recon_tensor):
     mse = float(torch.mean((gt_tensor - recon_tensor) ** 2).item())
     psnr = 20 * np.log10(1.0 / (np.sqrt(mse) + 1e-12)) if mse > 0 else 100.0
@@ -353,6 +434,25 @@ def parse_args():
         default=1.0,
         help="Gradient retention ratio (1.0=100%, 0.1=10%, 0.01=1%).",
     )
+    p.add_argument(
+        "--sparsify_method",
+        type=str,
+        default="global_topk",
+        choices=["global_topk", "layerwise_topk"],
+        help="Sparsification method to apply to captured gradients.",
+    )
+    p.add_argument(
+        "--front_ratio",
+        type=float,
+        default=0.1,
+        help="Retention ratio for front layers (body.0, body.2) in layer-wise top-k.",
+    )
+    p.add_argument(
+        "--back_ratio",
+        type=float,
+        default=0.9,
+        help="Retention ratio for back layers (body.4, fc.0) in layer-wise top-k.",
+    )
     p.add_argument("--seed", type=int, default=1234)
     return p.parse_args()
 
@@ -369,13 +469,18 @@ def main():
     print("\n[FedAvg Config]")
     print(f"  clients={args.num_clients}, rounds={args.rounds}, frac={args.frac}")
     print(f"  local_epochs={args.local_epochs}, batch_size={args.batch_size}, local_lr={args.local_lr}")
-    print(f"  sparsity={args.sparsity}")
+    print(f"  sparsify_method={args.sparsify_method}")
+    if args.sparsify_method == "global_topk":
+        print(f"  sparsity={args.sparsity}")
+    else:
+        print(f"  front_ratio={args.front_ratio}, back_ratio={args.back_ratio}")
 
     net = LeNet()
     torch.manual_seed(args.seed)
     net.apply(weights_init)
     net = net.to(device)
     num_classes = net.fc[-1].out_features
+    param_names = [name for name, _ in net.named_parameters()]
 
     captured_grad = None
     captured_gt = None
@@ -403,13 +508,30 @@ def main():
                 captured_label = int(y.item())
                 captured_model_state = copy.deepcopy(net.state_dict())
                 captured_grad = sample_gradient(net, x, y, device, num_classes)
-                captured_grad, sparse_stats = sparsify_gradients_topk(captured_grad, args.sparsity)
+                if args.sparsify_method == "global_topk":
+                    captured_grad, sparse_stats = sparsify_gradients_topk(captured_grad, args.sparsity)
+                else:
+                    captured_grad, sparse_stats = sparsify_gradients_layerwise_topk(
+                        captured_grad,
+                        param_names=param_names,
+                        front_ratio=args.front_ratio,
+                        back_ratio=args.back_ratio,
+                    )
                 print(f"  [Attack Capture] client={cid}, label={captured_label}, idx={victim_idx}")
                 print(
                     "  [Sparsification] kept="
                     f"{sparse_stats['kept']}/{sparse_stats['total']} "
                     f"({sparse_stats['retention_ratio'] * 100:.2f}%)"
                 )
+                if "layer_stats" in sparse_stats:
+                    for layer_stat in sparse_stats["layer_stats"]:
+                        print(
+                            "    "
+                            f"{layer_stat['layer']} "
+                            f"{layer_stat['kept']}/{layer_stat['total']} "
+                            f"({layer_stat['retention_ratio'] * 100:.2f}%) "
+                            f"[configured {layer_stat['configured_ratio'] * 100:.1f}%]"
+                        )
 
             local_state, local_loss = train_local(net, loader, device, num_classes, args.local_lr, args.local_epochs)
             local_states.append(local_state)

@@ -1,371 +1,150 @@
 # -*- coding: utf-8 -*-
 import argparse
-import importlib.util
-import math
-import os
-import sys
-from pathlib import Path
-from typing import Dict, List, Tuple
+import numpy as np
+from pprint import pprint
+
+from PIL import Image
+import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.autograd import grad
+import torchvision
+from torchvision import models, datasets, transforms
+print(torch.__version__, torchvision.__version__)
 
-if not os.environ.get("DISPLAY"):
-    import matplotlib
+from utils import label_to_onehot, cross_entropy_for_onehot
 
-    matplotlib.use("Agg")
+parser = argparse.ArgumentParser(description='Deep Leakage from Gradients.')
+parser.add_argument('--index', type=int, default=25,
+                    help='the index for leaking images on CIFAR.')
+parser.add_argument('--image', type=str, default="",
+                    help='the path to customized image.')
 
-import matplotlib.pyplot as plt
+# ========================= [추가] .pt gradient 파일 경로 =========================
+parser.add_argument('--pt_path', type=str, default="",
+                    help='path to saved gradient .pt file')
+# ==============================================================================
 
+args = parser.parse_args()
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Reconstruct an image from the .pt gradient artifact saved by 0326.py."
-    )
-    parser.add_argument(
-        "--gradient-path",
-        type=str,
-        required=True,
-        help="Path to the .pt file saved by 0326.py with --save-dlg.",
-    )
-    parser.add_argument(
-        "--steps",
-        type=int,
-        default=300,
-        help="Number of outer optimization steps for the DLG attack.",
-    )
-    parser.add_argument(
-        "--history-every",
-        type=int,
-        default=10,
-        help="Save and log one reconstruction snapshot every N steps.",
-    )
-    parser.add_argument(
-        "--tv-weight",
-        type=float,
-        default=0.0,
-        help="Optional total-variation regularization weight.",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=1234,
-        help="Random seed for dummy image and dummy label initialization.",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="auto",
-        choices=["auto", "cpu", "cuda", "mps"],
-        help="Device used for the attack.",
-    )
-    parser.add_argument(
-        "--optimize-label",
-        action="store_true",
-        help="Optimize a dummy label instead of using the label stored in the .pt artifact.",
-    )
-    parser.add_argument(
-        "--model-init-seed",
-        type=int,
-        default=None,
-        help=(
-            "Fallback seed used only when the .pt artifact does not contain model_state_dict. "
-            "Useful mainly for old round-1 artifacts."
-        ),
-    )
-    parser.add_argument(
-        "--save-figure",
-        type=str,
-        default="",
-        help="Optional output path for the reconstruction progress figure.",
-    )
-    parser.add_argument(
-        "--save-final-image",
-        type=str,
-        default="",
-        help="Optional output path for the final reconstructed image.",
-    )
-    parser.add_argument(
-        "--no-show",
-        action="store_true",
-        help="Do not open a matplotlib window. Useful in headless environments.",
-    )
-    return parser
+device = "mps" if torch.backends.mps.is_available() else "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+print("Running on %s" % device)
 
+# 0326.py와 동일하게 CIFAR-10 기준으로 공격 대상을 준비한다.
+num_classes = 10
+dst = datasets.CIFAR10("~/.torch", download=True)
+tp = transforms.ToTensor()
+tt = transforms.ToPILImage()
 
-def get_device(device_name: str) -> torch.device:
-    if device_name == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA was requested but is not available.")
-        return torch.device("cuda")
-    if device_name == "mps":
-        if not torch.backends.mps.is_available():
-            raise RuntimeError("MPS was requested but is not available.")
-        return torch.device("mps")
-    if device_name == "cpu":
-        return torch.device("cpu")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
+img_index = args.index
+gt_data = tp(dst[img_index][0]).to(device)
 
+if len(args.image) > 1:
+    gt_data = Image.open(args.image)
+    gt_data = tp(gt_data).to(device)
 
-def validate_args(args: argparse.Namespace) -> None:
-    if args.steps < 1:
-        raise ValueError("--steps must be at least 1.")
-    if args.history_every < 1:
-        raise ValueError("--history-every must be at least 1.")
-    if args.tv_weight < 0:
-        raise ValueError("--tv-weight must be non-negative.")
+gt_data = gt_data.view(1, *gt_data.size())
+gt_label = torch.tensor([dst[img_index][1]], dtype=torch.long).to(device)
+gt_label = gt_label.view(1,)
+gt_onehot_label = label_to_onehot(gt_label, num_classes=num_classes)
 
+plt.imshow(tt(gt_data[0].cpu()))
 
-def load_0326_module(script_dir: Path):
-    module_path = script_dir / "0326.py"
-    spec = importlib.util.spec_from_file_location("fedsgd_0326_module", module_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Failed to load module from {module_path}")
+from models.vision import LeNet, weights_init
+net = LeNet().to(device)
 
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+torch.manual_seed(1234)
 
+net.apply(weights_init)
+criterion = cross_entropy_for_onehot
 
-def load_gradient_artifact(path: Path) -> Dict[str, object]:
-    try:
-        artifact = torch.load(path, map_location="cpu", weights_only=False)
-    except TypeError:
-        artifact = torch.load(path, map_location="cpu")
-    if not isinstance(artifact, dict):
-        raise ValueError("Loaded artifact is not a dictionary.")
-    if "named_grads" not in artifact:
-        raise ValueError("Artifact does not contain 'named_grads'.")
-    if "label" not in artifact:
-        raise ValueError("Artifact does not contain 'label'.")
-    return artifact
+# ========================= [수정 시작] original gradient 준비 =========================
+if len(args.pt_path) > 0:
+    print(f"Load gradients from: {args.pt_path}")
+    artifact = torch.load(args.pt_path, map_location=device)
 
+    # 0) 모델 상태가 저장되어 있으면 그대로 로드해 gradient를 만든 시점의 모델과 맞춘다.
+    if isinstance(artifact, dict) and "model_state_dict" in artifact:
+        net.load_state_dict(artifact["model_state_dict"])
 
-def build_model(fedsgd_module, artifact: Dict[str, object], device: torch.device, model_init_seed: int | None):
-    model_name = artifact.get("model_name")
-    if model_name is not None and model_name != "SimpleCifarCNN":
-        raise ValueError(
-            f"Unsupported model_name '{model_name}'. "
-            "This attack script currently supports only SimpleCifarCNN artifacts from 0326.py."
-        )
+    # 1) label이 저장되어 있으면 사용
+    if isinstance(artifact, dict) and "label" in artifact:
+        gt_label = torch.tensor([artifact["label"]], dtype=torch.long, device=device).view(1,)
+        gt_onehot_label = label_to_onehot(gt_label, num_classes=num_classes)
 
-    model = fedsgd_module.SimpleCifarCNN().to(device)
+    # 2) named_grads 형태인 경우
+    if isinstance(artifact, dict) and "named_grads" in artifact:
+        named_grads = artifact["named_grads"]
 
-    model_state_dict = artifact.get("model_state_dict")
-    if model_state_dict is not None:
-        model.load_state_dict(model_state_dict)
+        # net.parameters() 순서에 맞게 gradient 리스트 생성
+        original_dy_dx = []
+        for name, param in net.named_parameters():
+            if name not in named_grads:
+                raise KeyError(f"Gradient for parameter '{name}' not found in pt file.")
+            original_dy_dx.append(named_grads[name].detach().clone().to(device))
+
+    # 3) grads 또는 dy_dx 리스트 형태인 경우
+    elif isinstance(artifact, dict) and "grads" in artifact:
+        original_dy_dx = [g.detach().clone().to(device) for g in artifact["grads"]]
+
+    elif isinstance(artifact, dict) and "dy_dx" in artifact:
+        original_dy_dx = [g.detach().clone().to(device) for g in artifact["dy_dx"]]
+
+    # 4) 그냥 리스트/튜플로 저장된 경우
+    elif isinstance(artifact, (list, tuple)):
+        original_dy_dx = [g.detach().clone().to(device) for g in artifact]
+
     else:
-        if model_init_seed is None:
-            raise ValueError(
-                "This .pt artifact does not contain model_state_dict. "
-                "Please regenerate it with the updated 0326.py, or pass --model-init-seed "
-                "only if this was captured before any server update."
-            )
-        torch.manual_seed(model_init_seed)
-        model = fedsgd_module.SimpleCifarCNN().to(device)
+        raise ValueError("Unsupported .pt format. Need 'named_grads', 'grads', 'dy_dx', or list/tuple.")
 
-    model.eval()
-    return model
+else:
+    # 원래 코드 그대로: gt_data로부터 직접 gradient 계산
+    pred = net(gt_data)
+    y = criterion(pred, gt_onehot_label)
+    dy_dx = torch.autograd.grad(y, net.parameters())
+    original_dy_dx = [_.detach().clone() for _ in dy_dx]
+# ========================= [수정 끝] ============================================
 
+# generate dummy data and label
+dummy_data = torch.randn(gt_data.size()).to(device).requires_grad_(True)
+dummy_label = torch.randn(gt_onehot_label.size()).to(device).requires_grad_(True)
 
-def get_normalization(artifact: Dict[str, object]) -> Tuple[torch.Tensor, torch.Tensor]:
-    normalization = artifact.get("normalization")
-    if isinstance(normalization, dict):
-        mean = normalization.get("mean", (0.4914, 0.4822, 0.4465))
-        std = normalization.get("std", (0.2023, 0.1994, 0.2010))
-    else:
-        mean = (0.4914, 0.4822, 0.4465)
-        std = (0.2023, 0.1994, 0.2010)
+plt.imshow(tt(dummy_data[0].cpu()))
 
-    mean_tensor = torch.tensor(mean, dtype=torch.float32).view(1, 3, 1, 1)
-    std_tensor = torch.tensor(std, dtype=torch.float32).view(1, 3, 1, 1)
-    return mean_tensor, std_tensor
+optimizer = torch.optim.LBFGS([dummy_data, dummy_label])
 
-
-def get_input_shape(artifact: Dict[str, object]) -> Tuple[int, int, int, int]:
-    sample_shape = artifact.get("sample_shape")
-    if isinstance(sample_shape, tuple) and len(sample_shape) == 4:
-        return sample_shape
-    if isinstance(sample_shape, tuple) and len(sample_shape) == 3:
-        return (1, *sample_shape)
-    return (1, 3, 32, 32)
-
-
-def cross_entropy_for_soft_labels(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    return torch.mean(torch.sum(-target * F.log_softmax(pred, dim=-1), dim=1))
-
-
-def total_variation(x: torch.Tensor) -> torch.Tensor:
-    tv_h = torch.mean(torch.abs(x[:, :, 1:, :] - x[:, :, :-1, :]))
-    tv_w = torch.mean(torch.abs(x[:, :, :, 1:] - x[:, :, :, :-1]))
-    return tv_h + tv_w
-
-
-def denormalize_image(image: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-    image = image.detach().cpu()
-    mean = mean.detach().cpu()
-    std = std.detach().cpu()
-    return (image * std + mean).clamp(0.0, 1.0)
-
-
-def reconstruct(
-    model: nn.Module,
-    artifact: Dict[str, object],
-    device: torch.device,
-    steps: int,
-    history_every: int,
-    tv_weight: float,
-    seed: int,
-    optimize_label: bool,
-) -> Tuple[torch.Tensor, List[Tuple[int, torch.Tensor]], List[Tuple[int, float]], int | None]:
-    torch.manual_seed(seed)
-
-    mean, std = get_normalization(artifact)
-    mean_device = mean.to(device)
-    std_device = std.to(device)
-    lower_bound = (torch.zeros_like(mean_device) - mean_device) / std_device
-    upper_bound = (torch.ones_like(mean_device) - mean_device) / std_device
-
-    input_shape = get_input_shape(artifact)
-    target_grads = {
-        name: grad_tensor.to(device)
-        for name, grad_tensor in artifact["named_grads"].items()
-    }
-    target_label = torch.tensor([int(artifact["label"])], dtype=torch.long, device=device)
-
-    expected_names = [name for name, _ in model.named_parameters()]
-    missing_names = [name for name in expected_names if name not in target_grads]
-    if missing_names:
-        raise ValueError(f"Artifact gradients are missing model parameters: {missing_names}")
-
-    dummy_data = torch.randn(input_shape, device=device, requires_grad=True)
-    parameters_to_optimize = [dummy_data]
-    dummy_label_logits = None
-
-    if optimize_label:
-        dummy_label_logits = torch.randn((1, 10), device=device, requires_grad=True)
-        parameters_to_optimize.append(dummy_label_logits)
-
-    optimizer = torch.optim.LBFGS(parameters_to_optimize, lr=1.0, max_iter=1)
-    history: List[Tuple[int, torch.Tensor]] = []
-    loss_history: List[Tuple[int, float]] = []
-
-    def closure() -> torch.Tensor:
+history = []
+for iters in range(300):
+    def closure():
         optimizer.zero_grad()
 
-        with torch.no_grad():
-            dummy_data.clamp_(lower_bound, upper_bound)
+        dummy_pred = net(dummy_data)
+        dummy_onehot_label = F.softmax(dummy_label, dim=-1)
+        dummy_loss = criterion(dummy_pred, dummy_onehot_label)
+        dummy_dy_dx = torch.autograd.grad(dummy_loss, net.parameters(), create_graph=True)
 
-        dummy_pred = model(dummy_data)
-        if optimize_label:
-            assert dummy_label_logits is not None
-            dummy_label = F.softmax(dummy_label_logits, dim=-1)
-            dummy_loss = cross_entropy_for_soft_labels(dummy_pred, dummy_label)
-        else:
-            dummy_loss = nn.CrossEntropyLoss()(dummy_pred, target_label)
-
-        dummy_grads = torch.autograd.grad(dummy_loss, model.parameters(), create_graph=True)
-        grad_diff = torch.zeros((), device=device)
-        for (name, _), dummy_grad in zip(model.named_parameters(), dummy_grads):
-            grad_diff = grad_diff + ((dummy_grad - target_grads[name]) ** 2).sum()
-
-        if tv_weight > 0:
-            grad_diff = grad_diff + tv_weight * total_variation(dummy_data)
-
+        grad_diff = 0
+        for gx, gy in zip(dummy_dy_dx, original_dy_dx):
+            grad_diff += ((gx - gy) ** 2).sum()
         grad_diff.backward()
+
         return grad_diff
 
-    for step_idx in range(steps):
-        optimizer.step(closure)
+    optimizer.step(closure)
+    if iters % 10 == 0:
+        current_loss = closure()
+        print(iters, "%.4f" % current_loss.item())
+        history.append(tt(dummy_data[0].detach().cpu()))
 
-        should_log = (step_idx % history_every == 0) or (step_idx == steps - 1)
-        if should_log:
-            current_loss = closure().item()
-            current_image = denormalize_image(dummy_data, mean, std).squeeze(0)
-            history.append((step_idx, current_image))
-            loss_history.append((step_idx, current_loss))
-            print(f"step={step_idx:04d} grad_loss={current_loss:.6f}")
+plt.figure(figsize=(12, 8))
+for i in range(min(30, len(history))):
+    plt.subplot(3, 10, i + 1)
+    plt.imshow(history[i])
+    plt.title("iter=%d" % (i * 10))
+    plt.axis('off')
 
-    inferred_label = None
-    if optimize_label:
-        assert dummy_label_logits is not None
-        inferred_label = int(torch.argmax(F.softmax(dummy_label_logits, dim=-1), dim=1).item())
-
-    final_image = denormalize_image(dummy_data, mean, std)
-    return final_image, history, loss_history, inferred_label
-
-
-def plot_history(history: List[Tuple[int, torch.Tensor]]):
-    num_panels = len(history)
-    if num_panels == 0:
-        raise ValueError("No history snapshots were collected for plotting.")
-    cols = min(5, num_panels)
-    rows = math.ceil(num_panels / cols)
-    figure = plt.figure(figsize=(3 * cols, 3 * rows))
-
-    for index, (step_idx, image) in enumerate(history, start=1):
-        axis = figure.add_subplot(rows, cols, index)
-        axis.imshow(image.permute(1, 2, 0))
-        axis.set_title(f"step={step_idx}")
-        axis.axis("off")
-
-    figure.tight_layout()
-    return figure
-
-
-def main() -> None:
-    args = build_parser().parse_args()
-    validate_args(args)
-    gradient_path = Path(args.gradient_path).expanduser().resolve()
-    if not gradient_path.exists():
-        raise FileNotFoundError(f"Gradient artifact not found: {gradient_path}")
-
-    device = get_device(args.device)
-    print(f"Running on {device}")
-    print(f"Loading artifact from {gradient_path}")
-
-    artifact = load_gradient_artifact(gradient_path)
-    script_dir = Path(__file__).resolve().parent
-    fedsgd_module = load_0326_module(script_dir)
-    model = build_model(fedsgd_module, artifact, device, args.model_init_seed)
-
-    final_image, history, _, inferred_label = reconstruct(
-        model=model,
-        artifact=artifact,
-        device=device,
-        steps=args.steps,
-        history_every=args.history_every,
-        tv_weight=args.tv_weight,
-        seed=args.seed,
-        optimize_label=args.optimize_label,
-    )
-
-    print(f"artifact_label={artifact['label']}")
-    if inferred_label is not None:
-        print(f"inferred_label={inferred_label}")
-
-    figure = plot_history(history)
-    if args.save_figure:
-        figure_path = Path(args.save_figure).expanduser().resolve()
-        figure_path.parent.mkdir(parents=True, exist_ok=True)
-        figure.savefig(figure_path, bbox_inches="tight")
-        print(f"Saved progress figure to {figure_path}")
-
-    if args.save_final_image:
-        final_image_path = Path(args.save_final_image).expanduser().resolve()
-        final_image_path.parent.mkdir(parents=True, exist_ok=True)
-        plt.imsave(final_image_path, final_image.squeeze(0).permute(1, 2, 0).numpy())
-        print(f"Saved final reconstructed image to {final_image_path}")
-
-    if not args.no_show:
-        plt.show()
-
-
-if __name__ == "__main__":
-    main()
+plt.show()
