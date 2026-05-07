@@ -1,0 +1,13 @@
+pt_file: /Users/joseoglae/hansung/Gong/DLG/SGD/fedavg_iter_outputs/fedavg_iter_gradients.pt
+round: 8
+client_id: 0
+sample_index: 40030
+artifact_label: 9
+gt_label: 9
+input_shape: (1, 3, 32, 32)
+ratio_pairs: [(0.95, 0.95), (0.99, 0.91), (0.91, 0.99)]
+summary_json: /Users/joseoglae/hansung/Gong/DLG/SGD/fedavg_iter_attack_layerwise_outputs/round_8/client_0/summary.json
+summary_txt: /Users/joseoglae/hansung/Gong/DLG/SGD/fedavg_iter_attack_layerwise_outputs/round_8/client_0/summary.txt
+loss_comparison: /Users/joseoglae/hansung/Gong/DLG/SGD/fedavg_iter_attack_layerwise_outputs/round_8/client_0/loss_comparison.png
+loss_comparison_txt: /Users/joseoglae/hansung/Gong/DLG/SGD/fedavg_iter_attack_layerwise_outputs/round_8/client_0/loss_comparison.txt
+final_reconstruction_grid: /Users/joseoglae/hansung/Gong/DLG/SGD/fedavg_iter_attack_layerwise_outputs/round_8/client_0/final_reconstruction_grid.png

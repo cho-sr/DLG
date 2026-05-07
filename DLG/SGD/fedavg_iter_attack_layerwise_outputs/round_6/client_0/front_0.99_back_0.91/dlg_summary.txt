@@ -1,0 +1,12 @@
+ratio_label: front=0.99, back=0.91
+front_ratio: 0.99
+back_ratio: 0.91
+pred_class: 9
+dummy_class: 9
+iters: 400
+final_grad_loss: 0.000009
+total_kept: 14760/15826 (93.26%)
+body.0: 902/912 (98.90%)
+body.2: 3575/3612 (98.98%)
+body.4: 3286/3612 (90.97%)
+fc.0: 6997/7690 (90.99%)
